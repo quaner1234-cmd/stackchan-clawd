@@ -1,0 +1,16 @@
+{
+  "mcpServers": {
+    "calculator": {
+      "type": "stdio",
+      "command": ".venv\Scripts\python.exe",
+      "args": [
+        "calculator.py"
+      ],
+      "env": {
+        "PYTHONIOENCODING": "utf-8",
+        "PYTHONUTF8": "1",
+        "NO_COLOR": "1"
+      }
+    }
+  }
+}

@@ -1,0 +1,10 @@
+# Runtime dependencies for the computer-side bridge.
+# Python 3.11+ recommended (3.12 tested).
+#
+# The wake-word model runtime is separate; see requirements-wake.txt.
+
+pyserial==3.5
+requests==2.32.5
+
+# sherpa-onnx and numpy are only needed for local voice wake-up.
+# Install them with:  pip install -r requirements-wake.txt

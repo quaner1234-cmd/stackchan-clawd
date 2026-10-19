@@ -1,0 +1,5 @@
+# Existing project wake-word/.venv. Do not install into the ESP-IDF SDK runtime.
+sherpa-onnx==1.13.8
+numpy==2.5.4
+pyserial==3.5
+requests==2.32.5

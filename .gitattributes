@@ -1,0 +1,15 @@
+# The .cmd scripts in mcp-bridge are GBK/CP936 encoded by design (the upstream
+# convention for Chinese Windows batch files). Do not let Git rewrite their
+# bytes or line endings -- a UTF-8 or LF conversion breaks them at runtime.
+*.cmd -text
+*.wav -text
+*.png -text
+*.ico -text
+
+# Keep text files in the repository normalised to LF in the index.
+*.py text eol=lf
+*.js text eol=lf
+*.md text eol=lf
+*.txt text eol=lf
+*.json text eol=lf
+*.html text eol=lf

@@ -1,0 +1,13 @@
+# 小克 ×《星月夜》静态预览
+
+使用内置 image_gen。4:3 横向构图，小克保持扁平橙色像素形象，位于村庄上方山坡。仅保存静态预览，未加入轮播或刷写设备。
+
+## 提示词
+
+Use case: stylized-concept.
+Asset type: ONE complete static artwork preview for Xiao Ke / Clawd's robot screen. Landscape, exact 4:3 composition, 1280x960 or same 4:3 ratio. No text, signature, watermark, frame, UI or collage.
+Primary request: Xiao Ke / Clawd inside Vincent van Gogh's The Starry Night. Preserve the instantly recognizable swirling cobalt-blue night sky, luminous yellow stars with circular halos, bright crescent moon, dark flame-shaped cypress on the left, softly rolling hills, and quiet village with a church steeple below. The painting is the main scene, not a generic starry background.
+Add ONE small-to-medium orange Clawd mascot sitting on a foreground hillside or low wall above the village, quietly looking up toward the sweeping stars. Place the mascot in the lower-right portion where it is clearly readable without covering the major sky spiral, moon, cypress or steeple. Its orange silhouette is a warm little accent against the blue scene, about a fifth of the image width. Calm wonder, cozy and charming, suitable for a young child.
+CRITICAL identity and style: The user liked a previous "Clawd with a Pearl Earring" because the orange mascot remained FLAT and two-dimensional. Keep that same approach. Xiao Ke is a simple flat terracotta-orange horizontal rectangular pixel crab, roughly 1.5 times wider than tall, with a stepped pixel contour, two little BLACK SQUARE eyes, a tiny simple mouth, four short blocky stepped feet, and two small simple blocky arms. It can be turned or tilted slightly upward through graphic placement of its eyes, but the orange body remains one flat 2D silhouette. No thick cube sides, visible top planes, bevels, voxel sculpture, 3D toy, realistic rounded crab, big pincers, antennae, human head, human body or long neck. Keep tiny appendages discrete, not a humanoid.
+Medium: Reinterpret The Starry Night in rich expressive oil-painted impasto strokes and rhythmic sky bands, with faithful deep blue, turquoise, cream and yellow palette. The orange mascot has subtle matching paint grain INSIDE its flat shape, with a crisp stepped silhouette and simple flat color; do not model it as a three-dimensional block. A gentle warm rim accent is okay, no cast 3D geometry. The character belongs naturally to the painted setting.
+Composition: landscape 4:3 crop/recomposition with generous sky and legible village. Major Starry Night forms remain recognizable at 320x240. The mascot's small black square eyes and orange shape must also remain legible at that size. No extra characters, accessories, headscarf, pearl, laptop, keyboard, speech bubbles, decorative hearts or added objects. One peaceful still artwork.

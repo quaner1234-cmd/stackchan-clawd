@@ -1,0 +1,52 @@
+# --- Secrets and local configuration ---
+.env
+.env.local
+*.key
+*.pem
+mcp_config.local.json
+
+# --- Runtime state, logs and generated evidence ---
+*.log
+*.jsonl
+logs/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# --- Local machine state ---
+home.json
+settings.json
+daily-settings.json
+alarm-settings.json
+drink-settings.json
+wake-settings.json
+photos/
+parent-tasks/
+
+# --- Build output, vendored SDK and device images ---
+build/
+dist/
+*.bin
+*.elf
+*.map
+*.o
+.venv/
+venv/
+node_modules/
+esp-idf/
+idf-tools/
+software/
+refs/
+
+# --- Large generated media (regenerate with tools/) ---
+clawd-face-lab/tools/render-check/
+clawd-face-lab/tools/render-check/*.png
+clawd-face-lab/tools/render-check/*.gif
+clawd-face-lab/tools/render-check/motion-frames/
+
+# --- Editor and OS noise ---
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
