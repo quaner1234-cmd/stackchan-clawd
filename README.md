@@ -92,7 +92,7 @@ python clawd-face-lab/chat/bridge.py --port COM5
 
 ## 第三方材料
 
-本仓库包含或衍生自以下第三方工作，详见 `LICENSE` 的 THIRD-PARTY NOTICES：
+本仓库包含或衍生自以下第三方工作，详见 [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md)：
 
 - `mcp-bridge/mcp_pipe.py`、`calculator.py` 衍生自 [78/mcp-calculator](https://github.com/78/mcp-calculator) v0.2.0（MIT）
 - 目标固件是 M5Stack 的（MIT，Copyright 2026 M5Stack Technology CO LTD）；`firmware/hal/` 下是本项目新增的文件
