@@ -1,5 +1,6 @@
 from pathlib import Path
 from tempfile import TemporaryDirectory
+import os
 import threading
 import time
 import unittest
@@ -18,10 +19,20 @@ class ActivityTests(unittest.TestCase):
         for t in np.arange(start,start+seconds,.02):self.m.feed(LOUD,float(t))
     def silence(self,start,seconds):
         for t in np.arange(start,start+seconds,.02):self.m.feed(QUIET,float(t))
-    def test_short_notifications_do_not_start_and_audio_requires_one_second(self):
+    def test_short_notifications_do_not_start_and_sustained_sound_starts(self):
         self.sound(seconds=.3);self.silence(.3,.4);self.assertFalse(self.m.active(.7))
-        self.sound(start=1,seconds=.9);self.assertFalse(self.m.active(1.9))
-        self.sound(start=1.9,seconds=.4);self.assertTrue(self.m.active(2.3))
+        self.m=AutoAudioMonitor()
+        self.sound(seconds=.5);self.assertFalse(self.m.active(.5))
+        self.sound(start=.5,seconds=.12);self.assertTrue(self.m.active(.62))
+    def test_normal_speech_pauses_do_not_reset_detection(self):
+        self.sound(seconds=.4);self.silence(.4,.3)
+        self.assertFalse(self.m.active(.7))
+        self.sound(start=.7,seconds=.24);self.assertTrue(self.m.active(.94))
+    def test_separated_notifications_and_old_sound_cannot_accumulate(self):
+        self.sound(seconds=.26);self.silence(.26,2)
+        self.sound(start=2.26,seconds=.26);self.assertFalse(self.m.active(2.52))
+        self.sound(start=2.52,seconds=.7);self.assertTrue(self.m.active(3.22))
+        self.assertFalse(self.m.active(4))
     def test_song_gap_does_not_exit_until_ten_seconds_quiet(self):
         self.sound();self.silence(1.2,9);self.assertFalse(self.m.quiet(10.2))
         self.silence(10.2,1.2);self.assertTrue(self.m.quiet(11.4))
@@ -33,6 +44,7 @@ class ActivityTests(unittest.TestCase):
     def test_pcm_retention_is_bounded_and_bad_length_rejected(self):
         self.sound(seconds=20);self.assertEqual(len(self.m.pcm),FRAME_BYTES)
         self.assertEqual(sum(len(pcm) for _,pcm in self.m.audio),3*FRAME_BYTES)
+        self.assertLessEqual(len(self.m.sound_frames),75)
         with self.assertRaises(RuntimeError):self.m.feed(LOUD*2)
     def test_burst_capture_preserves_each_frame_in_order(self):
         self.m.ready=True
@@ -56,6 +68,64 @@ class ActivityTests(unittest.TestCase):
             self.assertEqual(len(opened),1);self.assertEqual(closed,[])
         finally:m.stop();m.thread.join(2)
         self.assertEqual(closed,[1]);self.assertEqual(m.pcm,b'')
+    def test_transient_endpoint_failure_recovers_automatically(self):
+        opened=[];closed=[];fail=[True]
+        class Source:
+            name='fixture'
+            def __enter__(self):
+                opened.append(1)
+                if fail[0]:raise RuntimeError('endpoint temporarily unavailable')
+                return self
+            def __exit__(self,*_):closed.append(1)
+            def read(self):time.sleep(.02);return QUIET
+            def check_device(self):pass
+        m=AutoAudioMonitor(Source);m.start()
+        try:
+            deadline=time.monotonic()+1
+            while not m.error and time.monotonic()<deadline:time.sleep(.01)
+            self.assertEqual(m.error,'endpoint temporarily unavailable')
+            self.assertGreaterEqual(m.retry_count,1)
+            fail[0]=False
+            deadline=time.monotonic()+4
+            while not m.ready and time.monotonic()<deadline:time.sleep(.01)
+            self.assertTrue(m.ready);self.assertIsNone(m.error)
+            self.assertGreaterEqual(m.retry_count,1)
+            self.assertEqual(len(opened),2)
+        finally:m.stop();m.thread.join(4)
+        self.assertEqual(closed,[1])
+        self.assertFalse(m.ready);self.assertEqual(m.pcm,b'')
+    def test_endpoint_change_reopens_default_speaker(self):
+        opened=[];closed=[]
+        class Source:
+            name='fixture'
+            def __enter__(self):opened.append(1);return self
+            def __exit__(self,*_):closed.append(1)
+            def read(self):time.sleep(.02);return QUIET
+            def check_device(self):
+                if len(opened)==1:raise RuntimeError('电脑播放设备已改变；请重新开启电脑音箱。')
+        m=AutoAudioMonitor(Source);m.start()
+        try:
+            deadline=time.monotonic()+6
+            while len(opened)<2 and time.monotonic()<deadline:time.sleep(.01)
+            self.assertEqual(len(opened),2)
+            self.assertTrue(m.ready);self.assertIsNone(m.error)
+        finally:m.stop();m.thread.join(4)
+        self.assertEqual(closed,[1,1])
+    @unittest.skipUnless(os.environ.get('CLAWD_AUDIO_INTEGRATION')=='1', 'opt-in Windows audio integration check')
+    def test_real_loopback_reports_continuous_detection(self):
+        m=AutoAudioMonitor();m.start()
+        try:
+            deadline=time.monotonic()+4
+            while not m.ready and time.monotonic()<deadline:time.sleep(.01)
+            self.assertTrue(m.ready,m.error)
+            self.assertTrue(m.name)
+            first=m.frames
+            deadline=time.monotonic()+2
+            while m.frames<first+25 and time.monotonic()<deadline:time.sleep(.01)
+            self.assertGreaterEqual(m.frames,first+25)
+            self.assertIsNone(m.error)
+            self.assertLessEqual(len(m.audio),3)
+        finally:m.stop();m.thread.join(4)
     def test_settings_default_off_and_persist_only_switch(self):
         with TemporaryDirectory(dir=Path(__file__).parent) as tmp:
             p=Path(tmp)/'audio.json';self.assertFalse(load_auto_enabled(p))
@@ -69,8 +139,10 @@ class AutoBridgeTests(unittest.TestCase):
         self.b=Bridge('unused',lambda *_:None);self.addCleanup(self.b.pool.shutdown,False)
         self.b.state='ready';self.b.device_pc_audio=True;self.b.device_scenes=True
         self.b.connection_event=MagicMock();self.b.serial=MagicMock();self.b.serial.is_open=True
-        self.m=AutoAudioMonitor();self.m.ready=True;self.m.sound_since=time.monotonic()-2
-        self.m.last_sound=time.monotonic();self.b.pc_watch=self.m;self.b.set_pc_auto(True)
+        self.m=AutoAudioMonitor();self.m.ready=True
+        now=time.monotonic()
+        for i in range(40):self.m.feed(LOUD,now-.78+i*.02)
+        self.b.pc_watch=self.m;self.b.set_pc_auto(True)
     def test_idle_sound_requests_audio_but_busy_chat_photo_dance_cannot_be_taken_over(self):
         for phase in ('listening','thinking','uploading','speaking','dancing'):
             self.b.phase=phase;self.b.service_pc_auto();self.assertFalse(self.b.pc_requested)
@@ -103,11 +175,13 @@ class AutoBridgeTests(unittest.TestCase):
         self.m.ready=False;self.b.request_pc_audio();self.b.service_pc_audio()
         self.assertEqual(self.b.phase,'idle');self.assertTrue(self.b.pc_requested)
         self.b.serial.write.assert_not_called()
-    def test_monitor_failure_is_reported_once_and_does_not_restart(self):
+    def test_monitor_failure_pauses_automatic_playback_and_keeps_recovering(self):
         self.m.error='fixture endpoint removed'
+        self.m.ready=False;self.b.pc_auto_playing=True
         self.b.service_pc_auto();self.b.service_pc_auto()
-        self.b.connection_event.assert_called_once_with('pc_auto_error')
         self.assertFalse(self.b.pc_requested)
+        self.assertIs(self.b.pc_watch,self.m)
+        self.assertFalse(self.m.stop_event.is_set())
 
 
 if __name__=='__main__':unittest.main()

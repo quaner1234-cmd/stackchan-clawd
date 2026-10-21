@@ -20,6 +20,8 @@ RATE=24000
 SAMPLES=480
 FRAME_BYTES=SAMPLES*2
 WINDOW=4
+AUTO_SOUND_WINDOW=1.5
+AUTO_SOUND_FRAMES=30  # 600ms of audible PCM, allowing normal speech pauses.
 AUTO_SETTINGS=Path(__file__).with_name('pc-audio-settings.json')
 
 
@@ -95,10 +97,12 @@ class AutoAudioMonitor:
     """One render-loopback owner; retain at most 60ms, never room audio."""
     def __init__(self,source_factory=LoopbackSource):
         self.source_factory=source_factory;self.condition=threading.Condition()
-        self.stop_event=threading.Event();self.ready=False;self.error=None;self.error_reported=False
+        self.stop_event=threading.Event();self.ready=False;self.error=None
+        self.retry_at=0.0;self.retry_count=0;self.last_ready_at=None
         self.thread=None;self.name='';self.sequence=0;self.pcm=b''
         self.audio=deque(maxlen=3)
-        self.sound_since=None;self.last_sound=None;self.quiet_since=None;self.blocked=False
+        self.sound_frames=deque(maxlen=75)
+        self.last_sound=None;self.quiet_since=None;self.blocked=False
         self.frames=0;self.rms=0;self.warnings=0
         self.warning_types={}
 
@@ -112,19 +116,18 @@ class AutoAudioMonitor:
             self.pcm=pcm;self.sequence+=1;self.frames+=1;self.rms=round(rms)
             self.audio.append((self.sequence,pcm))
             if rms>=80:
-                if self.last_sound is None or now-self.last_sound>.2:self.sound_since=now
+                self.sound_frames.append(now)
                 self.last_sound=now;self.quiet_since=None
             else:
                 if self.quiet_since is None:self.quiet_since=now
-                if self.last_sound is not None and now-self.last_sound>.2:self.sound_since=None
                 if self.blocked and now-self.quiet_since>=1:self.blocked=False
             self.condition.notify_all()
 
     def active(self,now=None):
         now=time.monotonic() if now is None else now
         with self.condition:
-            return (not self.blocked and self.sound_since is not None and self.last_sound is not None
-                    and now-self.sound_since>=1 and now-self.last_sound<.2)
+            return (not self.blocked and self.last_sound is not None and now-self.last_sound<.2
+                    and sum(now-stamp<=AUTO_SOUND_WINDOW for stamp in self.sound_frames)>=AUTO_SOUND_FRAMES)
 
     def quiet(self,now=None):
         now=time.monotonic() if now is None else now
@@ -132,7 +135,7 @@ class AutoAudioMonitor:
 
     def suppress(self):
         with self.condition:
-            self.blocked=True;self.sound_since=None;self.quiet_since=None
+            self.blocked=True;self.sound_frames.clear();self.quiet_since=None
 
     def start(self):
         self.thread=threading.Thread(target=self.run,daemon=True,name='clawd-audio-watch');self.thread.start()
@@ -142,24 +145,45 @@ class AutoAudioMonitor:
         with self.condition:self.condition.notify_all()
 
     def run(self):
-        try:
-            with self.source_factory() as source,warnings.catch_warnings(record=True) as caught:
-                warnings.simplefilter('always')
-                warnings.filterwarnings('ignore',message='Setting the shape on a NumPy array has been deprecated.*',category=DeprecationWarning)
-                self.name=source.name;last_check=time.monotonic();self.ready=True
-                while not self.stop_event.is_set():
-                    self.feed(source.read());self.warnings+=len(caught)
-                    for warning in caught:
-                        key=(type(warning.message).__name__+': '+str(warning.message))[:180]
-                        if key in self.warning_types or len(self.warning_types)<8:
-                            self.warning_types[key]=self.warning_types.get(key,0)+1
-                    caught.clear()
-                    if time.monotonic()-last_check>=2:source.check_device();last_check=time.monotonic()
-        except Exception as exc:
-            self.error=str(exc) if isinstance(exc,RuntimeError) else '无法检测电脑声音；请检查Windows播放设备。'
-        finally:
-            self.ready=False;self.stop()
-            with self.condition:self.pcm=b'';self.audio.clear()
+        delay=1.0
+        while not self.stop_event.is_set():
+            self.retry_at=0.0
+            was_ready=False
+            try:
+                with self.source_factory() as source,warnings.catch_warnings(record=True) as caught:
+                    warnings.simplefilter('always')
+                    warnings.filterwarnings('ignore',message='Setting the shape on a NumPy array has been deprecated.*',category=DeprecationWarning)
+                    self.name=source.name;last_check=time.monotonic()
+                    with self.condition:
+                        self.ready=True;self.error=None;self.last_ready_at=last_check
+                        self.condition.notify_all()
+                    was_ready=True
+                    while not self.stop_event.is_set():
+                        self.feed(source.read());self.warnings+=len(caught)
+                        for warning in caught:
+                            key=(type(warning.message).__name__+': '+str(warning.message))[:180]
+                            if key in self.warning_types or len(self.warning_types)<8:
+                                self.warning_types[key]=self.warning_types.get(key,0)+1
+                        caught.clear()
+                        if time.monotonic()-last_check>=2:source.check_device();last_check=time.monotonic()
+                delay=1.0
+            except Exception as exc:
+                message=str(exc) if isinstance(exc,RuntimeError) else '无法检测电脑声音；请检查Windows播放设备。'
+                with self.condition:
+                    self.ready=False
+                    self.error=message
+                    self.retry_count=self.retry_count+1
+                    self.retry_at=time.monotonic()+(1.0 if was_ready else delay)
+                    self.sound_frames.clear();self.last_sound=None;self.quiet_since=None
+                    self.pcm=b'';self.audio.clear()
+                    self.condition.notify_all()
+                wait=1.0 if was_ready else delay
+                if self.stop_event.wait(wait):break
+                if not was_ready:delay=min(delay*2,5.0)
+        with self.condition:
+            self.ready=False;self.retry_at=0.0
+            self.pcm=b'';self.audio.clear();self.sound_frames.clear()
+            self.condition.notify_all()
 
     def source(self):return MonitoredSource(self)
 
@@ -171,7 +195,7 @@ class MonitoredSource:
         self.check_device();self.name=self.monitor.name;self.sequence=self.monitor.sequence;return self
     def __exit__(self,*_):pass
     def check_device(self):
-        if self.monitor.error or not self.monitor.ready or self.monitor.stop_event.is_set():
+        if not self.monitor.ready or self.monitor.stop_event.is_set():
             raise RuntimeError(self.monitor.error or '电脑声音检测已停止。')
     def read(self):
         m=self.monitor

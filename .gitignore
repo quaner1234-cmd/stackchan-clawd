@@ -21,6 +21,7 @@ alarm-settings.json
 drink-settings.json
 wake-settings.json
 pc-audio-settings.json
+auto-audio-reassessment-*.json
 backups/
 captures/
 *-settings.tmp

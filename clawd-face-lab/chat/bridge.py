@@ -149,17 +149,13 @@ class Bridge:
         if self.state!='ready' or self.closed.is_set() or not self.device_pc_audio:return
         if watch is None:
             self.pc_watch=AutoAudioMonitor();self.pc_watch.start();return
-        if watch.error:
-            if not watch.error_reported:
-                watch.error_reported=True
-                if self.pc_auto_playing:self.request_pc_audio(False)
-                self.connection_event('pc_auto_error')
-                self.report('自动音箱检测暂停：'+watch.error+' 关闭再开启自动开关可重试。')
-            return
         if watch.stop_event.is_set():
             if not watch.thread or not watch.thread.is_alive():self.pc_watch=None
             return
-        if not watch.ready:return
+        if not watch.ready:
+            if self.pc_auto_playing:
+                self.request_pc_audio(False,automatic=True)
+            return
         if self.pc_auto_playing and self.pc_session is not None:
             if not self.pc_hourly_resume and watch.quiet():
                 self.request_pc_audio(False,automatic=True)
@@ -210,11 +206,11 @@ class Bridge:
         if self.wake_requested or self.wake_device_active:
             self.stop_wake();return
         if time.monotonic()<self.control_wake_ready_at:return
-        if self.pc_watch and not self.pc_watch.error and not self.pc_watch.ready:return
+        if self.pc_watch and not self.pc_watch.ready:return
         with self.write_lock:
             if not self.pc_requested or self.closed.is_set():return
             self.phase='pc_audio';self.pause_continuous()
-            if self.pc_watch and not self.pc_watch.error:
+            if self.pc_watch:
                 self.pc_session=SpeakerSession(self,self.pc_watch.source)
             else:self.pc_session=SpeakerSession(self)
             self.serial.write(b'F')
@@ -1426,7 +1422,7 @@ def main():
         if bridge:bridge.set_pc_auto(pc_auto_enabled.get())
         try:save_auto_enabled(pc_auto_enabled.get())
         except OSError:status.set('自动音箱开关本次已生效，但未能保存。')
-    ttk.Checkbutton(speaker_card,text='自动电脑音箱：有声约1秒开启，安静10秒回待机',variable=pc_auto_enabled,
+    ttk.Checkbutton(speaker_card,text='自动电脑音箱：检测到音乐或说话时开启，安静10秒回待机',variable=pc_auto_enabled,
         command=change_pc_auto).pack(anchor='w',pady=(0,6))
     pc_auto_status=tk.StringVar(value='自动音箱：已关闭')
     ttk.Label(speaker_card,textvariable=pc_auto_status,style='MutedCard.TLabel',wraplength=700).pack(anchor='w',pady=(0,6))
@@ -1531,7 +1527,7 @@ def main():
         if bridge:
             watch=bridge.pc_watch
             pc_auto_status.set('自动音箱：'+('已关闭' if not bridge.pc_auto_enabled else
-                '等待连接' if not ready else '检测暂停，请关闭再开启：'+watch.error if watch and watch.error else
+                '等待连接' if not ready else '声卡暂不可用，正在自动重试：'+(watch.error or '等待Windows播放设备') if watch and watch.error else
                 '等当前声音结束后重新检测' if watch and watch.blocked else
                 '检测电脑系统声音中 · 不保存音频' if watch and watch.ready else '正在准备检测…'))
             speaker_on=bridge.pc_requested or bridge.pc_hourly_resume or bridge.pc_session is not None
