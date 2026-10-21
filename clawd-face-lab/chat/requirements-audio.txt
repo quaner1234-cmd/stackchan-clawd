@@ -1,0 +1,5 @@
+# Windows WASAPI loopback; loaded only when PC speaker mode is enabled.
+SoundCard==0.4.6
+numpy==2.5.4
+# Used by the optional system-render verification scripts.
+sounddevice==0.5.6

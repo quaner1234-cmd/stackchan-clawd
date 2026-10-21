@@ -20,6 +20,14 @@ daily-settings.json
 alarm-settings.json
 drink-settings.json
 wake-settings.json
+backups/
+captures/
+*-settings.tmp
+*-check.json
+*-acceptance.json
+*-regression.json
+*-source-review.png
+*-source-preview.gif
 photos/
 parent-tasks/
 
@@ -37,6 +45,7 @@ esp-idf/
 idf-tools/
 software/
 refs/
+upstream/
 
 # --- Large generated media (regenerate with tools/) ---
 clawd-face-lab/tools/render-check/

@@ -23,6 +23,7 @@
 | `clawd-face-lab/index.html` | 小克形象的浏览器原型。直接双击打开即可，无需安装依赖或启动服务，页面本身不发起任何网络请求 |
 | `clawd-face-lab/chat/` | 电脑端主程序。`bridge.py` 是 USB 桥接与云端编排入口，`panel_design.py` 是家长面板的界面层，其余为唤醒、相机、日程、天气、动作控制等模块与单元测试 |
 | `clawd-face-lab/firmware/hal/` | 设备端新增的 10 个自研源文件（USB 音频通道、相机、动作、待机场景、手动控制、名画素材等） |
+| `clawd-face-lab/firmware/stackchan.patch` | 针对指定官方版本的完整集成补丁，包含主循环、音频和界面接线；应用方式见 firmware/README.md |
 | `clawd-face-lab/tools/` | 离线渲染检查、图标生成、名画素材构建等开发工具 |
 | `clawd-face-lab/artwork-previews/` | 小克 × 三幅名画的 AI 衍生预览图（原作均为公有领域） |
 | `mcp-bridge/` | 独立的 MCP 桥接程序，让设备端语音能调用电脑上的本地工具（当前只开放一个安全的计算器） |
@@ -59,7 +60,7 @@ $env:DASHSCOPE_API_KEY = "sk-..."
 python clawd-face-lab/chat/bridge.py --port COM5
 ```
 
-固件构建与刷写脚本在 `clawd-face-lab/device/`（本仓库未包含上游 SDK checkout 与编译产物，需按官方文档自行准备）。
+固件集成步骤见 [firmware/README.md](clawd-face-lab/firmware/README.md)。本仓库未包含上游 SDK checkout、编译产物或个人设备备份；先准备指定官方源码并应用补丁，再按官方流程构建。
 
 ## 已实现的能力
 
@@ -81,6 +82,7 @@ python clawd-face-lab/chat/bridge.py --port COM5
 **家长面板**
 - 四个页签：聊天陪伴 / 动作与音量 / 作息提醒 / 家长任务
 - 顶部「停止」始终可用；连接状态用状态点表示；内容可滚动
+- 电脑音箱：把 Windows 当前输出持续转播到小克，播放时显示拿话筒的小歌手；整点报时会暂时中断音箱，播完自动恢复。播放期间暂停语音唤醒，点屏幕可停止音箱并聊天
 
 ## 隐私设计
 

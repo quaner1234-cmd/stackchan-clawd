@@ -27,6 +27,7 @@ from idle_scenes import DrinkReminder, drink_pcm
 from workday_alarm import WorkdayAlarm, alarm_pcm
 from daily_routines import DailyRoutines, hourly_pcm
 from device_controls import packet as control_packet
+from pc_audio import SpeakerSession
 
 
 class Bridge:
@@ -119,9 +120,63 @@ class Bridge:
         self.control_status={}
         self.wake_device_active=False
         self.control_wake_ready_at=0.0
+        self.device_pc_audio=False
+        self.pc_requested=False
+        self.pc_session=None
+        self.pc_resume=False
+        self.pc_hourly_resume=False
+        self.pc_last_metrics=None
+        self.pc_wall_s=0.0
+
+    def request_pc_audio(self, enabled=True):
+        self.pc_hourly_resume=False  # An explicit user choice replaces automatic resume.
+        if not enabled:
+            self.pc_requested=False;self.pc_resume=False
+            if self.pc_session:self.pc_session.stop()
+            return True
+        if not self.device_pc_audio or not self.scene_idle() or self.control_requests:
+            self.report('请先停止聊天/动作，等设备空闲后再开启电脑音箱。');return False
+        self.pc_requested=True;self.pc_resume=False
+        self.report('正在开启电脑音箱，暂停语音唤醒……');return True
+
+    def service_pc_audio(self):
+        session=self.pc_session
+        if session:
+            if not session.done.is_set():return
+            self.pc_last_metrics=session.metrics
+            self.connection_event('pc_audio_done',error=session.error,**session.metrics)
+            self.pc_session=None;self.pc_requested=False;self.phase='paused'
+            if session.error or session.device_error:self.pc_hourly_resume=False
+            self.sent_sleep=None;self.sent_task_status=None;self.wake_retry_at=time.monotonic()+.9
+            if not session.device_done or session.device_error:
+                raise RuntimeError('电脑音箱未完成停止握手，正在重新连接。')
+            self.send(b'k')
+            self.report(session.error or ('电脑音箱暂时让出，正在准备整点报时。' if self.pc_hourly_resume else
+                '电脑音箱已关闭，恢复小克聊天与本地唤醒。'))
+            if self.pc_resume:
+                self.pc_resume=False;self.listen()
+            return
+        if not self.pc_requested:return
+        if self.phase not in ('idle','paused'):
+            self.pc_requested=False;return
+        if self.control_active or self.control_requests:return
+        if self.wake_requested or self.wake_device_active:
+            self.stop_wake();return
+        if time.monotonic()<self.control_wake_ready_at:return
+        with self.write_lock:
+            if not self.pc_requested or self.closed.is_set():return
+            self.phase='pc_audio';self.pause_continuous()
+            self.pc_session=SpeakerSession(self)
+            self.serial.write(b'F')
+            self.pc_session.start()
+            self.connection_event('pc_audio_start')
+            self.report('电脑音箱已开启：播放电脑当前输出声音。点屏幕可停止并聊天。')
 
     def request_control(self, kind, *values):
         control_packet(kind,values)  # Validate before changing intent.
+        if self.pc_session:
+            if kind=='volume':self.pc_session.volume=max(0,min(100,int(values[0])));return True
+            self.report('电脑音箱播放中，请先关闭音箱再调角度。');return False
         if self.state!='ready' or self.closed.is_set() or not self.device_controls:
             self.report('设备未连接或固件不支持手动控制。');return False
         with self.write_lock:self.control_requests[kind]=values
@@ -166,7 +221,23 @@ class Bridge:
 
     def request_hourly(self):
         self.hourly_requested=True
-        self.report('等小克空闲后试播当前整点报时。')
+        self.report('准备试播当前报时；电脑音箱会暂时让出，播完自动恢复。')
+
+    def resume_pc_after_hourly(self):
+        if not self.pc_hourly_resume:return
+        self.pc_hourly_resume=False
+        if self.state=='ready' and not self.closed.is_set():
+            self.pc_requested=True
+            self.connection_event('pc_audio_resume_after_hourly')
+            self.report('整点报时结束，正在恢复电脑音箱。')
+
+    def hourly_play_done(self, line):
+        if self.reminder_token!=self.epoch or self.reminder_kind!='hourly':return False
+        self.clear_reminder();self.phase='idle';self.wake_retry_at=time.monotonic()+.9
+        if b'cancelled=0' in line:self.resume_pc_after_hourly()
+        else:self.pc_hourly_resume=False
+        if not self.pc_requested:self.report('整点报时结束。')
+        return True
 
     def preview_sleep(self):
         self.sleep_preview_until=time.monotonic()+12
@@ -185,6 +256,16 @@ class Bridge:
                         self.send(b'Z' if sleeping else b'z');self.sent_sleep=sleeping
                 finally:self.write_lock.release()
         slot=self.daily.hourly_due(now)
+        if not (slot or self.hourly_requested):
+            # Disabled/expired while waiting for STOP: do not strand the audio intent.
+            if self.pc_hourly_resume and self.scene_idle():self.resume_pc_after_hourly()
+            return
+        if self.pc_requested or self.pc_session is not None:
+            if self.pc_session and self.pc_session.stop_event.is_set():return
+            if not self.pc_hourly_resume:self.connection_event('pc_audio_yield_for_hourly')
+            self.pc_hourly_resume=True;self.pc_requested=False
+            if self.pc_session:self.pc_session.stop()
+            return  # Wait for framed STOP + STREAM_DONE before any ordinary command.
         if not (slot or self.hourly_requested) or not self.scene_idle() or time.monotonic()<self.wake_retry_at:return
         with self.write_lock:
             if not self.scene_idle():return
@@ -195,7 +276,8 @@ class Bridge:
             except (OSError,ValueError,wave.Error):
                 if slot:self.daily.last_hour=slot
                 self.connection_event('hourly_asset_or_settings_error')
-                self.report('本机报时语音或设置不可用，本次跳过。');return
+                self.report('本机报时语音或设置不可用，本次跳过。')
+                self.resume_pc_after_hourly();return
             self.stop_wake()
             self.reminder_kind='hourly';self.reminder_token=self.epoch
             self.reminder_deadline=time.monotonic()+16
@@ -208,7 +290,7 @@ class Bridge:
         self.wake_enabled = bool(enabled)
 
     def wake_eligible(self):
-        return (self.wake_enabled and self.device_wake and self.state=='ready'
+        return (not self.pc_requested and not self.pc_hourly_resume and self.pc_session is None and self.wake_enabled and self.device_wake and self.state=='ready'
                 and not self.closed.is_set() and self.turns<self.max_turns
                 and self.phase in ('idle','paused') and not self.uploading
                 and not self.photo_pending and not self.photo_preview
@@ -243,6 +325,9 @@ class Bridge:
 
     def service_alarm(self, now=None):
         slot=self.workday_alarm.due(now)
+        if (slot or self.alarm_requested) and (self.pc_requested or self.pc_session is not None):
+            self.request_pc_audio(False)
+            return  # Release framed USB first; the existing alarm then takes priority.
         if self.alarm_token is not None:
             if ((not self.workday_alarm.enabled and self.alarm_scheduled) or
                     (self.alarm_deadline is not None and time.monotonic()>self.alarm_deadline)):
@@ -292,10 +377,11 @@ class Bridge:
         return True
 
     def enforce_chat_limit(self, now=None):
+        if self.pc_requested or self.pc_session is not None:return False
         local_enabled=self.workday_alarm.enabled or self.daily.hourly_enabled or self.daily.sleep_enabled
         if self.chat_expired and not local_enabled:return True
         now=time.monotonic() if now is None else now
-        elapsed=self.activity_s if (self.wake_enabled or local_enabled) else now-self.started
+        elapsed=self.activity_s if (self.wake_enabled or local_enabled) else now-self.started-self.pc_wall_s
         if elapsed<=1800:return False
         if not local_enabled:
             self.report('本次30分钟已结束，麦克风已关闭。');return True
@@ -310,7 +396,7 @@ class Bridge:
         self.report('等小克空闲后'+('送爱心。' if kind=='love' else '播放喝水提醒。'))
 
     def scene_idle(self):
-        return (self.device_scenes and self.state=='ready' and not self.closed.is_set()
+        return (not self.pc_requested and self.pc_session is None and self.device_scenes and self.state=='ready' and not self.closed.is_set()
                 and self.phase in ('idle','paused') and not self.uploading
                 and not self.photo_pending and not self.photo_preview
                 and not self.parent_capture and self.parent_restart_at is None
@@ -384,12 +470,13 @@ class Bridge:
 
     def service_wake(self):
         now=time.monotonic()
+        if self.pc_session is not None:self.pc_wall_s+=now-self.activity_tick
         if self.phase=='arming' and self.listen_deadline is not None and now>self.listen_deadline:
             self.listen_deadline=None
             self.cancel()
             self.report('设备没有及时进入录音，已暂停；可点屏幕重试。')
         # Idle local listening does not consume the original 30-minute chat guard.
-        if (self.alarm_token is None and self.reminder_token is None and not self.control_active and
+        if (self.pc_session is None and self.alarm_token is None and self.reminder_token is None and not self.control_active and
                 (self.phase not in ('idle','paused') or (self.future and not self.future.done()))):
             self.activity_s += now-self.activity_tick
         self.activity_tick=now
@@ -627,10 +714,16 @@ class Bridge:
 
     def send(self, data):
         with self.write_lock:
+            if self.pc_session:
+                if data in (b'x',b'q'):self.pc_session.stop()
+                return  # Only framed writes from SpeakerSession may own this USB RX path.
             if self.serial and self.serial.is_open:
                 self.serial.write(data)
 
     def cancel(self, reset=False):
+        self.pc_hourly_resume=False
+        self.pc_requested=False;self.pc_resume=False
+        if self.pc_session:self.pc_session.stop()
         self.control_requests.clear();self.control_active=False;self.control_deadline=None
         self.hourly_requested=False
         self.sleep_preview_until=0.0
@@ -665,6 +758,11 @@ class Bridge:
         self.report('已停止。点一下屏幕或“开始聆听”可以继续。')
 
     def listen(self, wake=False):
+        self.pc_hourly_resume=False
+        if self.pc_session:
+            self.pc_resume=True;self.pc_session.stop()
+            self.report('正在关闭电脑音箱，随后开始聆听。');return
+        self.pc_requested=False
         if self.chat_expired:
             self.report('本次聊天时间已到，重新打开可恢复聊天；闹钟仍保留。');return
         if self.state != 'ready' or self.closed.is_set() or self.serial is None or not self.serial.is_open:
@@ -725,7 +823,9 @@ class Bridge:
             while not self.closed.is_set():
                 if self.state!='ready' and time.monotonic()>ready_deadline:
                     raise RuntimeError('机器人仍是离线版或连接未完成，请先检查语音固件。')
-                if self.state != 'ready' and time.monotonic()-last_hello > 1:
+                # A faulted PCM receiver discards bytes until 1.5s of USB quiet.
+                # One-second hello retries would keep resetting that quiet timer.
+                if self.state != 'ready' and time.monotonic()-last_hello > 2:
                     self.send(b'h')
                     last_hello=time.monotonic()
                 if self.enforce_chat_limit():break
@@ -733,11 +833,12 @@ class Bridge:
                 self.resume_if_due()
                 self.resume_parent_if_due()
                 self.service_alarm()
+                self.service_pc_audio()
                 self.service_controls()
                 self.service_daily()
                 self.service_scenes()
                 self.service_wake()
-                if self.state=='ready' and self.task_status!=self.sent_task_status and not self.uploading:
+                if self.pc_session is None and self.state=='ready' and self.task_status!=self.sent_task_status and not self.uploading:
                     pending_status=self.task_status
                     command={'running':b'W','completed':b'D','failed':b'E','cancelled':b'V','idle':b'V'}.get(pending_status,b'V')
                     if self.write_lock.acquire(blocking=False):
@@ -770,6 +871,8 @@ class Bridge:
                         raise RuntimeError('USB待机音频完整性检查失败。')
                     self.wake_frame(session,sequence,pcm)
                     pcm=None
+                elif line.startswith(b'CLAWD STREAM_'):
+                    if self.pc_session:self.pc_session.event(line)
                 elif line.startswith(b'CLAWD WAKE_STARTED '):
                     self.wake_device_active=True
                     session=int(re.search(rb'session=(\d+)',line).group(1))
@@ -876,6 +979,10 @@ class Bridge:
                 elif line.startswith(b'CLAWD CONTROL_'):
                     self.control_event(line)
                 elif line.startswith((b'CLAWD CANCELLED', b'CLAWD CHAT_RESET')):
+                    self.pc_hourly_resume=False
+                    if self.pc_session:
+                        self.pc_resume=not line.startswith(b'CLAWD CHAT_RESET')
+                        self.pc_session.stop()
                     self.control_requests.clear();self.control_active=False;self.control_deadline=None
                     self.hourly_requested=False;self.sleep_preview_until=0.0
                     self.claim_alarm()
@@ -900,9 +1007,7 @@ class Bridge:
                     self.report('已停止；长按会清空本次对话。点一下可重新说。')
                 elif line.startswith(b'CLAWD PLAY_DONE'):
                     if self.alarm_play_done(line):continue
-                    if self.reminder_token==self.epoch and self.reminder_kind=='hourly':
-                        self.clear_reminder();self.phase='idle';self.wake_retry_at=time.monotonic()+.9
-                        self.report('整点报时结束。');continue
+                    if self.hourly_play_done(line):continue
                     self.wake_retry_at=time.monotonic()+.9
                     if self.reminder_token==self.epoch:
                         self.phase='reminding'
@@ -930,6 +1035,7 @@ class Bridge:
                         self.pause_continuous()
                         self.report(f'点一下屏幕再说。已完成 {self.turns}/{self.max_turns} 轮。')
                 elif line.startswith(b'CLAWD CHAT_READY'):
+                    self.device_pc_audio=b'pc_stream=pcm1' in line
                     self.device_controls=b'controls=pose1' in line
                     if self.device_controls:self.control_requests['status']=()
                     self.device_sleep=b'sleep_scene=1' in line;self.sent_sleep=None
@@ -947,6 +1053,7 @@ class Bridge:
                 elif line.startswith(b'CLAWD HOST_TIMEOUT'):
                     raise RuntimeError('机器人连接已超时，请等待重新连接。')
                 elif line.startswith(b'CLAWD LISTENING'):
+                    self.pc_hourly_resume=False
                     if self.chat_expired or self.alarm_token is not None:
                         self.claim_alarm()
                         self.epoch+=1;self.clear_alarm();self.alarm_requested=False
@@ -1004,6 +1111,8 @@ class Bridge:
             self.connection_event('error', stage=stage, error_type=type(exc).__name__)
             self.report(self.last_error)
         finally:
+            self.pc_hourly_resume=False
+            if self.pc_session:self.pc_session.stop()
             if self.wake_engine:
                 self.connection_event('wake_metrics_final',**self.wake_engine.metrics())
                 self.wake_engine.reset()
@@ -1250,6 +1359,16 @@ def main():
     ttk.Label(control_page,textvariable=control_note,style='Muted.TLabel',wraplength=760).pack(anchor='w',pady=9)
     ttk.Label(control_page,text='回正：左右 0°、抬头 15°。动作到位后自动放松电机；上方“停止”随时可用。',style='Muted.TLabel',wraplength=760).pack(anchor='w')
     show_pose();show_volume()
+    speaker_card=card(control_page,'电脑音箱','把电脑当前输出的音乐、视频声音，通过USB交给小克。只在本机传输，不保存声音。')
+    speaker_state=tk.StringVar(value='电脑音箱：已关闭')
+    def toggle_speaker():
+        if bridge:bridge.request_pc_audio(not (bridge.pc_requested or bridge.pc_hourly_resume or bridge.pc_session is not None))
+    speaker_button=ttk.Button(speaker_card,text='开启电脑音箱',style='Accent.TButton',command=toggle_speaker,state='disabled')
+    speaker_button.pack(anchor='w',pady=(0,8))
+    ttk.Label(speaker_card,textvariable=speaker_state,style='MutedCard.TLabel',wraplength=700).pack(anchor='w')
+    ttk.Label(speaker_card,text='音箱期间暂停语音唤醒；整点报时会暂时中断音箱，播完自动恢复。\n喝水等空闲；起床叫醒会停止音箱。点屏幕可停止并聊天。单声道，视频同步以实际听感为准。',
+        style='MutedCard.TLabel',wraplength=700).pack(anchor='w',pady=(8,0))
+    speaker_card.pack_configure(before=controls)
     drink_settings=DrinkReminder();drink_enabled=tk.BooleanVar(value=drink_settings.enabled)
     def change_drink():
         target=bridge.drink_reminder if bridge else drink_settings
@@ -1344,6 +1463,15 @@ def main():
         manual_ready=ready and bridge.device_controls and not bridge.control_active
         for widget in manual_widgets:widget.configure(state='normal' if manual_ready else 'disabled')
         if bridge:
+            speaker_on=bridge.pc_requested or bridge.pc_hourly_resume or bridge.pc_session is not None
+            speaker_button.configure(text='关闭电脑音箱' if speaker_on else '开启电脑音箱',
+                state='normal' if ready and bridge.device_pc_audio else 'disabled')
+            speaker_state.set('电脑音箱：'+('未连接' if not ready else
+                '固件暂未支持' if not bridge.device_pc_audio else
+                '暂时让出报时，结束后自动恢复' if bridge.pc_hourly_resume else
+                '正在停止…' if bridge.pc_session and bridge.pc_session.stop_event.is_set() else
+                '正在播放 · '+(bridge.pc_session.source or '正在打开Windows声音') if bridge.pc_session else
+                '正在等麦克风释放…' if bridge.pc_requested else '已关闭'))
             feedback=bridge.control_status
             if feedback:
                 actual=(feedback.get('yaw',0),feedback.get('pitch',150),feedback.get('volume',100))
@@ -1373,11 +1501,11 @@ def main():
                 '本次20轮已结束，请退出后重开' if bridge.turns>=bridge.max_turns else
                 '正在本机加载模型' if bridge.wake_engine is None else
                 '待机监听中 · 无云调用 · 不保存音频' if bridge.wake_session is not None else
-                '聊天/操作中暂停，结束后恢复待机'))
+                '电脑音箱期间暂停，关闭音箱后恢复' if speaker_on else '聊天/操作中暂停，结束后恢复待机'))
         for button in (listen_button,stop_button,reset_button):
             button.configure(state='normal' if ready else 'disabled')
         reconnect_button.configure(state='disabled' if worker and worker.is_alive() else 'normal')
-        parent_button.configure(state='normal' if ready and not tasks.busy else 'disabled')
+        parent_button.configure(state='normal' if ready and not tasks.busy and bridge.pc_session is None and not bridge.pc_requested else 'disabled')
         while not parent_events.empty():
             task_state,metadata=parent_events.get_nowait()
             if task_state=='running':

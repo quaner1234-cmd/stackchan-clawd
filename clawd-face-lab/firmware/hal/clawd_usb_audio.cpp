@@ -10,6 +10,8 @@
 #include <cmath>
 #include <cstdio>
 #include <vector>
+#include <freertos/queue.h>
+#include <cstring>
 
 namespace clawd_audio {
 std::atomic<State> state{State::Idle};
@@ -25,6 +27,8 @@ static constexpr size_t rate=24000;
 std::atomic<bool> wake_active{false};
 static std::atomic<bool> wake_stop{false};
 static uint32_t wake_session=0;
+std::atomic<bool> stream_active{false};
+std::atomic<uint32_t> stream_rx_tick{0};
 
 void cancel() { cancelled=true; wake_stop=true; mouth=0; }
 
@@ -279,6 +283,112 @@ bool receive_and_play() {
     cancelled=false; owns_usb=true; state=State::Uploading;
     if(xTaskCreate(playback_task,"clawd_speaker",6144,nullptr,5,nullptr)!=pdPASS) {
         owns_usb=false; working=false; state=State::Idle; return false;
+    }
+    return true;
+}
+
+// Bounded PCM stream: KPCM + seq:u32 + bytes:u16 + flags:u16 + CRC32.
+// CRC covers the first 12 header bytes plus payload. 20ms/480 samples per frame.
+// The RX worker exclusively owns USB until a terminal frame (also after touch).
+struct StreamFrame { uint32_t sequence; int64_t received; int16_t pcm[480]; };
+struct StreamContext {
+    QueueHandle_t queue=nullptr;
+    std::atomic<bool> ended{false}, player_done{false};
+    uint32_t received=0, played=0, underruns=0, max_queue=0, bad=0, peak=0;
+};
+
+static void stream_player(void* arg) {
+    auto* ctx=static_cast<StreamContext*>(arg);
+    auto codec=Board::GetInstance().GetAudioCodec();
+    {
+    // Prime 40ms once; do not repeatedly reopen the codec at packet boundaries.
+    while(uxQueueMessagesWaiting(ctx->queue)<2&&!ctx->ended&&!cancelled)vTaskDelay(pdMS_TO_TICKS(2));
+    std::vector<int16_t> chunk(480,0);
+    StreamFrame frame{};
+    if(!cancelled)codec->EnableOutput(true);
+    while(!cancelled) {
+        if(xQueueReceive(ctx->queue,&frame,pdMS_TO_TICKS(25))==pdTRUE) {
+            const auto age=esp_timer_get_time()-frame.received;
+            std::copy(frame.pcm,frame.pcm+480,chunk.begin());
+            double energy=0;for(auto value:chunk){energy+=double(value)*value;ctx->peak=std::max(ctx->peak,uint32_t(std::abs(int(value))));}
+            mouth=std::clamp(int(std::sqrt(energy/480)*3/5/28),0,100);
+            codec->OutputData(chunk);
+            ctx->played++;
+            printf("CLAWD STREAM_ACK seq=%lu age_us=%lu queued=%u\n",(unsigned long)frame.sequence,
+                (unsigned long)age,unsigned(uxQueueMessagesWaiting(ctx->queue)));fflush(stdout);
+        } else {
+            if(ctx->ended)break;
+            ctx->underruns++;std::fill(chunk.begin(),chunk.end(),0);mouth=0;
+            codec->OutputData(chunk);
+        }
+    }
+    codec->EnableOutput(false);
+    } // Free the PCM vector before deleting this FreeRTOS task.
+    ctx->player_done=true;
+    vTaskDelete(nullptr);
+}
+
+static void stream_task(void*) {
+    auto codec=Board::GetInstance().GetAudioCodec();
+    codec->EnableInput(false);
+    StreamContext ctx;
+    ctx.queue=xQueueCreate(6,sizeof(StreamFrame));
+    if(!ctx.queue||xTaskCreate(stream_player,"clawd_pcm_out",6144,&ctx,6,nullptr)!=pdPASS) {
+        if(ctx.queue)vQueueDelete(ctx.queue);
+        transport_fault=true;finish(codec,nullptr);stream_active=false;
+        printf("CLAWD STREAM_ERROR reason=allocation\n");fflush(stdout);vTaskDelete(nullptr);return;
+    }
+    printf("CLAWD STREAM_READY rate=24000 frame_bytes=960 buffer_frames=6\n");fflush(stdout);
+    uint32_t expected=0;
+    const int64_t started=esp_timer_get_time();
+    bool terminal=false;
+    while(!terminal) {
+        uint8_t header[16];uint8_t payload[960];
+        if(!read_exact(header,sizeof(header),1500)){ctx.bad++;break;}
+        uint32_t sequence=0,checksum=0;uint16_t bytes=0,flags=0;
+        memcpy(&sequence,header+4,4);memcpy(&bytes,header+8,2);
+        memcpy(&flags,header+10,2);memcpy(&checksum,header+12,4);
+        if(memcmp(header,"KPCM",4)||sequence!=expected++||
+           !((flags==0&&bytes==960)||(flags==1&&bytes==0)||(flags==2&&bytes==2))) {ctx.bad++;break;}
+        if(bytes&&!read_exact(payload,bytes,750)){ctx.bad++;break;}
+        const auto crc=esp_crc32_le(esp_crc32_le(0,header,12),payload,bytes);
+        if(crc!=checksum){ctx.bad++;break;}
+        stream_rx_tick=uint32_t(esp_timer_get_time()/1000);
+        if(flags==1){terminal=true;cancelled=true;break;}
+        if(flags==2){
+            uint16_t volume=0;memcpy(&volume,payload,2);
+            if(volume>100){ctx.bad++;break;}
+            if(!cancelled)codec->SetOutputVolume(volume);
+            printf("CLAWD STREAM_VOLUME volume=%u\n",unsigned(volume));fflush(stdout);continue;
+        }
+        ctx.received++;
+        if(cancelled)continue; // Drain framed input until STOP; never interpret PCM as commands.
+        StreamFrame frame{};frame.sequence=sequence;frame.received=esp_timer_get_time();
+        memcpy(frame.pcm,payload,sizeof(frame.pcm));
+        if(xQueueSend(ctx.queue,&frame,pdMS_TO_TICKS(150))!=pdTRUE){ctx.bad++;break;}
+        ctx.max_queue=std::max(ctx.max_queue,uint32_t(uxQueueMessagesWaiting(ctx.queue)));
+    }
+    cancelled=true;ctx.ended=true;
+    while(!ctx.player_done)vTaskDelay(pdMS_TO_TICKS(2));
+    vQueueDelete(ctx.queue);
+    if(!terminal)transport_fault=true;
+    const auto duration=(esp_timer_get_time()-started)/1000;
+    finish(codec,nullptr);
+    stream_active=false;
+    printf("CLAWD STREAM_DONE frames=%lu played=%lu underruns=%lu max_queue=%lu bad=%lu duration_ms=%lu terminal=%d heap_internal=%u peak=%lu\n",
+        (unsigned long)ctx.received,(unsigned long)ctx.played,(unsigned long)ctx.underruns,
+        (unsigned long)ctx.max_queue,(unsigned long)ctx.bad,(unsigned long)duration,int(terminal),
+        unsigned(heap_caps_get_free_size(MALLOC_CAP_INTERNAL|MALLOC_CAP_8BIT)),(unsigned long)ctx.peak);
+    fflush(stdout);
+    vTaskDelete(nullptr);
+}
+
+bool receive_stream() {
+    if(!stop_wake()||working.exchange(true))return false;
+    cancelled=false;owns_usb=true;stream_active=true;state=State::Streaming;
+    stream_rx_tick=uint32_t(esp_timer_get_time()/1000);
+    if(xTaskCreate(stream_task,"clawd_pcm_rx",8192,nullptr,5,nullptr)!=pdPASS) {
+        stream_active=false;finish(Board::GetInstance().GetAudioCodec(),nullptr);return false;
     }
     return true;
 }

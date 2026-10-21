@@ -6,5 +6,5 @@
 pyserial==3.5
 requests==2.32.5
 
-# sherpa-onnx and numpy are only needed for local voice wake-up.
-# Install them with:  pip install -r requirements-wake.txt
+# Local voice wake-up: pip install -r requirements-wake.txt
+# Windows PC audio streaming: pip install -r requirements-audio.txt

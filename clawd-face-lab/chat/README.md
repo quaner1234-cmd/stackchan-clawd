@@ -36,6 +36,7 @@ python bridge.py --port COM5
 | `camera.py` | 相机取图与图像识别 |
 | `wake.py` | 本地语音唤醒（sherpa-onnx 离线模型） |
 | `device_controls.py` | 方向与音量指令的编码（限幅 + CRC） |
+| `pc_audio.py` | Windows WASAPI 系统声音回环与连续 USB 音箱传输 |
 | `idle_scenes.py` | 待机场景与轮播 |
 | `daily_routines.py` | 整点报时、喝水提醒、夜间睡觉 |
 | `workday_alarm.py` | 工作日叫醒 |
@@ -48,9 +49,20 @@ python bridge.py --port COM5
 ```powershell
 pip install -r requirements.txt        # 串口 + HTTP
 pip install -r requirements-wake.txt   # 本地语音唤醒（sherpa-onnx + numpy）
+pip install -r requirements-audio.txt  # 可选：Windows 电脑音箱与播放验证
 ```
 
-只用标准库也能跑 `--preview-ui` 界面预览。
+`--preview-ui` 需要运行依赖，但不需要串口设备或云端 API Key。
+
+## 电脑音箱、拿话筒与报时
+
+连接支持 `pc_stream=pcm1` 的固件后，在“动作与音量”页开启电脑音箱。程序捕获当前 Windows 默认播放端点的系统声音，通过 USB 连续交给小克；不打开电脑麦克风，不保存音频，不调用模型。需要 Windows 有在线的播放设备；仅使用 HDMI 音频时，关闭或拔掉显示器可能使音频端点消失。更换默认端点后需重新开启音箱。
+
+`pc_scene=singer1` 固件在音箱模式显示拿着话筒的小克，嘴巴随真实播放音量开合；退出音箱后回到原场景。单声道、24kHz/16bit，不承诺高保真或严格视频同步。音箱期间暂停本地语音唤醒；点屏幕停止音箱后进入聊天，长按仍清空对话。
+
+整点报时和“测试声音/试播报时”会先用校验 STOP/STREAM_DONE 释放 USB，再播已有本地语音；正常结束后自动恢复电脑声音。电脑播放器本身继续走当前进度，不回放报时期间的内容。点屏幕、停止、关闭音箱、USB/捕获错误会撤销自动恢复；起床闹钟仍优先停止音箱，之后不自动重开。夜间静音、报时开关与时段去重保留；喝水提醒仍等空闲。
+
+软件检查：在本目录执行 `python -m unittest discover -p "test_*.py"`。发布前146项通过。硬件检查另用 `check-pc-speaker.py`、`check-singer-scene.py`、`check-speaker-hourly.py`，默认占用 COM5，须先关正式窗口并阅读脚本。测试音会从机器人播放。整点验证只注入临时测试时间，不改系统时间和生产作息；公开仓库不包含私人回退备份，故旧版本对照可跳过，实际抢占/报时/恢复检查仍执行。2026-10-20开发机实机检查通过，真人听感、真实整点守候和长期运行验收仍待确认。
 
 ## 环境变量
 

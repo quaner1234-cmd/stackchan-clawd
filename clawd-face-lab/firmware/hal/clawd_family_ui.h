@@ -10,6 +10,11 @@ class ClawdFamilyUi {
     lv_obj_t *work=nullptr, *indicator=nullptr, *busy_dot=nullptr;
     lv_obj_t *arms[2]{}, *eyes[2]{}, *keys[4]{};
     lv_obj_t *dots[3]{}, *bars[3]{}, *pause[2]{}, *mic[4]{}, *check=nullptr;
+    lv_obj_t *singer=nullptr,*singer_body=nullptr,*singer_eyes[2]{},*singer_arm=nullptr;
+    lv_obj_t *singer_mouth=nullptr,*singer_tongue=nullptr,*singer_smile[3]{},*singer_notes[3]{};
+    uint32_t singer_until=0;
+    int singer_level=0;
+    bool previous_singer=false;
     uint32_t last_light=0, done_until=0, face_until=0;
     int previous=-1;
     bool previous_work=false;
@@ -25,10 +30,74 @@ class ClawdFamilyUi {
     static void visible(lv_obj_t* o,bool show) {
         if(show)lv_obj_remove_flag(o,LV_OBJ_FLAG_HIDDEN);else lv_obj_add_flag(o,LV_OBJ_FLAG_HIDDEN);
     }
+    static lv_obj_t* group(lv_obj_t* parent,int x,int y,int w,int h) {
+        auto o=block(parent,x,y,w,h,0);lv_obj_set_style_bg_opa(o,0,0);return o;
+    }
+    void init_singer(lv_obj_t* panel) {
+        singer=block(panel,0,0,320,240,0xFAF7F2);
+        block(singer,86,192,155,5,0xE8E0D5,3);
+        singer_body=group(singer,0,0,320,210);
+        // Keep the accepted squat 98x64 body and all six limbs.
+        block(singer_body,111,104,98,64,0xD97757);
+        block(singer_body,111,104,22,64,0xBA6249);
+        for(int x:{111,137,172,198})block(singer_body,x,162,10,17,0xD97757);
+        for(int x:{105,131,166,192})block(singer_body,x,176,12,11,0xD97757);
+        block(singer_body,111,162,10,17,0xBA6249);
+        block(singer_body,105,176,12,11,0xBA6249);
+        singer_eyes[0]=block(singer_body,149,120,10,10,0x282522);
+        singer_eyes[1]=block(singer_body,198,120,10,10,0x282522);
+        block(singer_body,141,138,12,4,0xECA28B,2);
+        block(singer_body,196,138,12,4,0xECA28B,2);
+        singer_smile[0]=block(singer_body,174,143,3,4,0x633C32);
+        singer_smile[1]=block(singer_body,177,147,9,3,0x633C32);
+        singer_smile[2]=block(singer_body,186,143,3,4,0x633C32);
+        singer_mouth=block(singer_body,174,143,14,10,0x633C32,5);
+        singer_tongue=block(singer_mouth,4,6,6,3,0xEAA18A,2);
+        singer_arm=block(singer_body,95,146,22,10,0xBA6249);
+        // Silver grille + dark handle, clearly held outside the face silhouette.
+        block(singer_body,222,143,7,33,0x555564,2);
+        block(singer_body,223,149,5,19,0x736E7D,1);
+        block(singer_body,222,173,7,5,0x3D3945,1);
+        block(singer_body,215,122,22,25,0x555564,10);
+        block(singer_body,218,124,16,19,0x99A5AD,7);
+        for(int i=0;i<5;i++)block(singer_body,218,127+i*3,16,1,0x616976);
+        block(singer_body,219,125,3,7,0xDCE2E5,2);
+        block(singer_body,215,142,22,4,0xBBC1C8,1);
+        block(singer_body,204,152,24,11,0xD97757,1);
+        block(singer_body,225,154,3,7,0xEAA18A,1);
+        const int xs[]={64,257,84},ys[]={109,95,65};
+        const uint32_t colors[]={0xD3A1B3,0x7EACC0,0xD8B36D};
+        for(int i=0;i<3;i++) {
+            auto note=group(singer,xs[i],ys[i],22,32);singer_notes[i]=note;
+            block(note,11,3,3,23,colors[i],1);block(note,13,3,8,4,colors[i],1);
+            block(note,3,23,11,7,colors[i],4);
+        }
+        visible(singer,false);
+    }
+    void update_singer(uint32_t now) {
+        const bool sounding=singer_level>0;
+        const int dy=sounding?int(2*std::sin(now*.006)):0;
+        lv_obj_set_y(singer_body,dy);
+        lv_obj_set_y(singer_arm,146+(sounding?int(3*std::sin(now*.007)):0));
+        const bool blink=now%5000>4800;
+        for(auto eye:singer_eyes){lv_obj_set_height(eye,blink?3:10);lv_obj_set_y(eye,blink?124:120);}
+        const int height=4+singer_level/10;
+        visible(singer_mouth,sounding);
+        for(auto part:singer_smile)visible(part,!sounding);
+        lv_obj_set_height(singer_mouth,height);lv_obj_set_y(singer_mouth,148-height/2);
+        lv_obj_set_y(singer_tongue,height-4);visible(singer_tongue,height>=9);
+        const int ys[]={109,95,65};
+        for(int i=0;i<3;i++) {
+            lv_obj_set_y(singer_notes[i],ys[i]-(sounding?int(3+3*std::sin(now*.003+i*2)):0));
+            lv_obj_set_style_opa(singer_notes[i],sounding?180+int(65*std::sin(now*.003+i)):60,0);
+        }
+    }
 public:
     ClawdIdleScenes scenes;
     bool task_running=false, task_error=false;
     void frame_metadata(uint32_t now) {
+        printf("CLAWD SINGER_FRAME visible=%d level=%d body_y=%d mic=handheld\n",
+            int(!lv_obj_has_flag(singer,LV_OBJ_FLAG_HIDDEN)),singer_level,int(lv_obj_get_y(singer_body)));
         printf("CLAWD WORK_FRAME tick=%lu arm_y=%d key_phase=%u scene=%s\n",(unsigned long)now,
                int(lv_obj_get_y(arms[0])),unsigned((now/180)%4),
                scenes.reminder()?"drink_reminder":lv_obj_has_flag(work,LV_OBJ_FLAG_HIDDEN)?"face_or_idle_scene":"laptop");
@@ -53,6 +122,7 @@ public:
         for(int i=0;i<4;i++)keys[i]=block(work,192+i*10,168,6,3,0xA9A29A,1);
         visible(work,false);
         scenes.init(panel);
+        init_singer(panel);
         indicator=block(panel,126,211,68,28,0xFAF7F2);
         for(int i=0;i<3;i++) {
             dots[i]=block(indicator,15+i*16,11,7,7,0xD99744,4);
@@ -80,16 +150,24 @@ public:
         using S=clawd_audio::State;
         bool listening=connected&&state==S::Listening;
         bool thinking=connected&&(state==S::Thinking||state==S::Uploading);
-        bool speaking=connected&&(state==S::Speaking||dancing);
+        bool speaking=connected&&(state==S::Speaking||state==S::Streaming||dancing);
+        if(connected&&state==S::Streaming){singer_until=now+600;singer_level=clawd_audio::mouth.load();}
+        // Brief visual tail allows a gentle return and an existing LCD capture
+        // after STOP, without injecting diagnostics into a live PCM stream.
+        bool singing=connected&&!listening&&!thinking&&!dancing&&!camera&&
+            (state==S::Streaming||((state==S::Idle||state==S::Paused)&&now<singer_until));
         bool done=connected&&done_until>now;
         // The laptop is the default scene, including offline and paused states.
         // Cover the short gaps between automatic listening segments, too.
         if(listening||thinking||speaking)face_until=now+1500;
-        bool working=!listening&&!thinking&&!speaking&&
+        bool working=!singing&&!listening&&!thinking&&!speaking&&
                      ((connected&&state==S::Paused)||now>=face_until);
-        int scene=scenes.update(working,listening||((thinking||speaking)&&!scenes.reminder())||dancing||camera,now);
+        int scene=scenes.update(working,singing||listening||((thinking||speaking)&&!scenes.reminder())||dancing||camera,now);
+        visible(singer,singing);
+        if(singing)update_singer(now);
+        if(singing!=previous_singer){previous_singer=singing;printf("CLAWD SINGER visible=%d\n",int(singing));}
         visible(work,working&&!scene);visible(busy_dot,connected&&task_running&&!working);
-        visible(indicator,connected&&!scene);
+        visible(indicator,connected&&!scene&&!singing);
         for(auto o:mic)visible(o,listening);
         for(auto o:dots)visible(o,thinking);
         for(auto o:bars)visible(o,speaking);

@@ -5,6 +5,8 @@
 *.wav -text
 *.png -text
 *.ico -text
+# Unified-diff context includes single-space blank lines; preserve exact bytes.
+*.patch -text -whitespace
 
 # Keep text files in the repository normalised to LF in the index.
 *.py text eol=lf
