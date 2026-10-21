@@ -27,7 +27,7 @@ from idle_scenes import DrinkReminder, drink_pcm
 from workday_alarm import WorkdayAlarm, alarm_pcm
 from daily_routines import DailyRoutines, hourly_pcm
 from device_controls import packet as control_packet
-from pc_audio import SpeakerSession
+from pc_audio import SpeakerSession, AutoAudioMonitor, load_auto_enabled, save_auto_enabled
 
 
 class Bridge:
@@ -127,16 +127,61 @@ class Bridge:
         self.pc_hourly_resume=False
         self.pc_last_metrics=None
         self.pc_wall_s=0.0
+        self.pc_auto_enabled=False
+        self.pc_auto_playing=False
+        self.pc_watch=None
 
-    def request_pc_audio(self, enabled=True):
+    def set_pc_auto(self, enabled):
+        self.pc_auto_enabled=bool(enabled)
+
+    def suppress_pc_auto(self):
+        self.pc_auto_playing=False
+        if self.pc_watch:self.pc_watch.suppress()
+
+    def service_pc_auto(self):
+        watch=self.pc_watch
+        if not self.pc_auto_enabled:
+            if self.pc_auto_playing:self.request_pc_audio(False)
+            if watch and self.pc_session is None:
+                watch.stop()
+                if not watch.thread or not watch.thread.is_alive():self.pc_watch=None
+            return
+        if self.state!='ready' or self.closed.is_set() or not self.device_pc_audio:return
+        if watch is None:
+            self.pc_watch=AutoAudioMonitor();self.pc_watch.start();return
+        if watch.error:
+            if not watch.error_reported:
+                watch.error_reported=True
+                if self.pc_auto_playing:self.request_pc_audio(False)
+                self.connection_event('pc_auto_error')
+                self.report('自动音箱检测暂停：'+watch.error+' 关闭再开启自动开关可重试。')
+            return
+        if watch.stop_event.is_set():
+            if not watch.thread or not watch.thread.is_alive():self.pc_watch=None
+            return
+        if not watch.ready:return
+        if self.pc_auto_playing and self.pc_session is not None:
+            if not self.pc_hourly_resume and watch.quiet():
+                self.request_pc_audio(False,automatic=True)
+                self.connection_event('pc_auto_silence_stop')
+            return
+        if (not self.pc_auto_playing and watch.active() and not self.hourly_requested and not self.alarm_requested
+                and not self.scene_request and not self.control_requests and self.scene_idle()):
+            if self.request_pc_audio(True,automatic=True):
+                self.connection_event('pc_auto_sound_start')
+
+    def request_pc_audio(self, enabled=True, automatic=False):
         self.pc_hourly_resume=False  # An explicit user choice replaces automatic resume.
         if not enabled:
+            if not automatic:self.suppress_pc_auto()
+            self.pc_auto_playing=False
             self.pc_requested=False;self.pc_resume=False
             if self.pc_session:self.pc_session.stop()
             return True
         if not self.device_pc_audio or not self.scene_idle() or self.control_requests:
             self.report('请先停止聊天/动作，等设备空闲后再开启电脑音箱。');return False
         self.pc_requested=True;self.pc_resume=False
+        self.pc_auto_playing=automatic
         self.report('正在开启电脑音箱，暂停语音唤醒……');return True
 
     def service_pc_audio(self):
@@ -146,6 +191,8 @@ class Bridge:
             self.pc_last_metrics=session.metrics
             self.connection_event('pc_audio_done',error=session.error,**session.metrics)
             self.pc_session=None;self.pc_requested=False;self.phase='paused'
+            if not self.pc_hourly_resume:self.pc_auto_playing=False
+            if session.error:self.suppress_pc_auto()
             if session.error or session.device_error:self.pc_hourly_resume=False
             self.sent_sleep=None;self.sent_task_status=None;self.wake_retry_at=time.monotonic()+.9
             if not session.device_done or session.device_error:
@@ -163,10 +210,13 @@ class Bridge:
         if self.wake_requested or self.wake_device_active:
             self.stop_wake();return
         if time.monotonic()<self.control_wake_ready_at:return
+        if self.pc_watch and not self.pc_watch.error and not self.pc_watch.ready:return
         with self.write_lock:
             if not self.pc_requested or self.closed.is_set():return
             self.phase='pc_audio';self.pause_continuous()
-            self.pc_session=SpeakerSession(self)
+            if self.pc_watch and not self.pc_watch.error:
+                self.pc_session=SpeakerSession(self,self.pc_watch.source)
+            else:self.pc_session=SpeakerSession(self)
             self.serial.write(b'F')
             self.pc_session.start()
             self.connection_event('pc_audio_start')
@@ -721,6 +771,7 @@ class Bridge:
                 self.serial.write(data)
 
     def cancel(self, reset=False):
+        self.suppress_pc_auto()
         self.pc_hourly_resume=False
         self.pc_requested=False;self.pc_resume=False
         if self.pc_session:self.pc_session.stop()
@@ -758,6 +809,7 @@ class Bridge:
         self.report('已停止。点一下屏幕或“开始聆听”可以继续。')
 
     def listen(self, wake=False):
+        self.suppress_pc_auto()
         self.pc_hourly_resume=False
         if self.pc_session:
             self.pc_resume=True;self.pc_session.stop()
@@ -833,6 +885,7 @@ class Bridge:
                 self.resume_if_due()
                 self.resume_parent_if_due()
                 self.service_alarm()
+                self.service_pc_auto()
                 self.service_pc_audio()
                 self.service_controls()
                 self.service_daily()
@@ -979,6 +1032,7 @@ class Bridge:
                 elif line.startswith(b'CLAWD CONTROL_'):
                     self.control_event(line)
                 elif line.startswith((b'CLAWD CANCELLED', b'CLAWD CHAT_RESET')):
+                    self.suppress_pc_auto()
                     self.pc_hourly_resume=False
                     if self.pc_session:
                         self.pc_resume=not line.startswith(b'CLAWD CHAT_RESET')
@@ -1053,6 +1107,7 @@ class Bridge:
                 elif line.startswith(b'CLAWD HOST_TIMEOUT'):
                     raise RuntimeError('机器人连接已超时，请等待重新连接。')
                 elif line.startswith(b'CLAWD LISTENING'):
+                    self.suppress_pc_auto()
                     self.pc_hourly_resume=False
                     if self.chat_expired or self.alarm_token is not None:
                         self.claim_alarm()
@@ -1111,6 +1166,7 @@ class Bridge:
             self.connection_event('error', stage=stage, error_type=type(exc).__name__)
             self.report(self.last_error)
         finally:
+            if self.pc_watch:self.pc_watch.stop()
             self.pc_hourly_resume=False
             if self.pc_session:self.pc_session.stop()
             if self.wake_engine:
@@ -1365,6 +1421,15 @@ def main():
         if bridge:bridge.request_pc_audio(not (bridge.pc_requested or bridge.pc_hourly_resume or bridge.pc_session is not None))
     speaker_button=ttk.Button(speaker_card,text='开启电脑音箱',style='Accent.TButton',command=toggle_speaker,state='disabled')
     speaker_button.pack(anchor='w',pady=(0,8))
+    pc_auto_enabled=tk.BooleanVar(value=load_auto_enabled())
+    def change_pc_auto():
+        if bridge:bridge.set_pc_auto(pc_auto_enabled.get())
+        try:save_auto_enabled(pc_auto_enabled.get())
+        except OSError:status.set('自动音箱开关本次已生效，但未能保存。')
+    ttk.Checkbutton(speaker_card,text='自动电脑音箱：有声约1秒开启，安静10秒回待机',variable=pc_auto_enabled,
+        command=change_pc_auto).pack(anchor='w',pady=(0,6))
+    pc_auto_status=tk.StringVar(value='自动音箱：已关闭')
+    ttk.Label(speaker_card,textvariable=pc_auto_status,style='MutedCard.TLabel',wraplength=700).pack(anchor='w',pady=(0,6))
     ttk.Label(speaker_card,textvariable=speaker_state,style='MutedCard.TLabel',wraplength=700).pack(anchor='w')
     ttk.Label(speaker_card,text='音箱期间暂停语音唤醒；整点报时会暂时中断音箱，播完自动恢复。\n喝水等空闲；起床叫醒会停止音箱。点屏幕可停止并聊天。单声道，视频同步以实际听感为准。',
         style='MutedCard.TLabel',wraplength=700).pack(anchor='w',pady=(8,0))
@@ -1425,6 +1490,7 @@ def main():
         bridge.camera=camera_module.Camera(keep_photos=keep_photos.get())
         bridge.set_continuous(continuous.get())
         bridge.set_wake(wake_enabled.get())
+        bridge.set_pc_auto(pc_auto_enabled.get())
         bridge.drink_reminder.enabled=drink_enabled.get()
         bridge.workday_alarm.enabled=alarm_enabled.get()
         bridge.daily.hourly_enabled=hourly_enabled.get();bridge.daily.sleep_enabled=sleep_enabled.get()
@@ -1463,6 +1529,11 @@ def main():
         manual_ready=ready and bridge.device_controls and not bridge.control_active
         for widget in manual_widgets:widget.configure(state='normal' if manual_ready else 'disabled')
         if bridge:
+            watch=bridge.pc_watch
+            pc_auto_status.set('自动音箱：'+('已关闭' if not bridge.pc_auto_enabled else
+                '等待连接' if not ready else '检测暂停，请关闭再开启：'+watch.error if watch and watch.error else
+                '等当前声音结束后重新检测' if watch and watch.blocked else
+                '检测电脑系统声音中 · 不保存音频' if watch and watch.ready else '正在准备检测…'))
             speaker_on=bridge.pc_requested or bridge.pc_hourly_resume or bridge.pc_session is not None
             speaker_button.configure(text='关闭电脑音箱' if speaker_on else '开启电脑音箱',
                 state='normal' if ready and bridge.device_pc_audio else 'disabled')

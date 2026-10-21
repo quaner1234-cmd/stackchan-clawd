@@ -5,7 +5,10 @@ SoundCard's installed WASAPI backend resamples to 24k; capture both channels
 before downmixing (its Windows mono-capture path has a known limitation).
 """
 import binascii
+from contextlib import nullcontext
 from collections import deque
+import json
+from pathlib import Path
 import queue
 import struct
 import threading
@@ -17,6 +20,17 @@ RATE=24000
 SAMPLES=480
 FRAME_BYTES=SAMPLES*2
 WINDOW=4
+AUTO_SETTINGS=Path(__file__).with_name('pc-audio-settings.json')
+
+
+def load_auto_enabled(path=AUTO_SETTINGS):
+    try:return json.loads(Path(path).read_text(encoding='utf-8')).get('auto_enabled') is True
+    except (OSError,ValueError,AttributeError):return False
+
+
+def save_auto_enabled(enabled,path=AUTO_SETTINGS):
+    path=Path(path);temp=path.with_suffix('.tmp')
+    temp.write_text(json.dumps({'auto_enabled':bool(enabled)})+'\n',encoding='utf-8');temp.replace(path)
 
 
 def packet(sequence, payload=b'', flags=0):
@@ -77,6 +91,100 @@ class LoopbackSource:
             if self.com_owned:self.ole.CoUninitialize()
 
 
+class AutoAudioMonitor:
+    """One render-loopback owner; retain at most 60ms, never room audio."""
+    def __init__(self,source_factory=LoopbackSource):
+        self.source_factory=source_factory;self.condition=threading.Condition()
+        self.stop_event=threading.Event();self.ready=False;self.error=None;self.error_reported=False
+        self.thread=None;self.name='';self.sequence=0;self.pcm=b''
+        self.audio=deque(maxlen=3)
+        self.sound_since=None;self.last_sound=None;self.quiet_since=None;self.blocked=False
+        self.frames=0;self.rms=0;self.warnings=0
+        self.warning_types={}
+
+    def feed(self,pcm,now=None):
+        import numpy as np
+        if len(pcm)!=FRAME_BYTES:raise RuntimeError('电脑声音帧长度错误。')
+        now=time.monotonic() if now is None else now
+        data=np.frombuffer(pcm,dtype='<i2').astype(np.float32)
+        rms=float(np.sqrt(np.mean(data*data)))
+        with self.condition:
+            self.pcm=pcm;self.sequence+=1;self.frames+=1;self.rms=round(rms)
+            self.audio.append((self.sequence,pcm))
+            if rms>=80:
+                if self.last_sound is None or now-self.last_sound>.2:self.sound_since=now
+                self.last_sound=now;self.quiet_since=None
+            else:
+                if self.quiet_since is None:self.quiet_since=now
+                if self.last_sound is not None and now-self.last_sound>.2:self.sound_since=None
+                if self.blocked and now-self.quiet_since>=1:self.blocked=False
+            self.condition.notify_all()
+
+    def active(self,now=None):
+        now=time.monotonic() if now is None else now
+        with self.condition:
+            return (not self.blocked and self.sound_since is not None and self.last_sound is not None
+                    and now-self.sound_since>=1 and now-self.last_sound<.2)
+
+    def quiet(self,now=None):
+        now=time.monotonic() if now is None else now
+        with self.condition:return self.quiet_since is not None and now-self.quiet_since>=10
+
+    def suppress(self):
+        with self.condition:
+            self.blocked=True;self.sound_since=None;self.quiet_since=None
+
+    def start(self):
+        self.thread=threading.Thread(target=self.run,daemon=True,name='clawd-audio-watch');self.thread.start()
+
+    def stop(self):
+        self.stop_event.set()
+        with self.condition:self.condition.notify_all()
+
+    def run(self):
+        try:
+            with self.source_factory() as source,warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter('always')
+                warnings.filterwarnings('ignore',message='Setting the shape on a NumPy array has been deprecated.*',category=DeprecationWarning)
+                self.name=source.name;last_check=time.monotonic();self.ready=True
+                while not self.stop_event.is_set():
+                    self.feed(source.read());self.warnings+=len(caught)
+                    for warning in caught:
+                        key=(type(warning.message).__name__+': '+str(warning.message))[:180]
+                        if key in self.warning_types or len(self.warning_types)<8:
+                            self.warning_types[key]=self.warning_types.get(key,0)+1
+                    caught.clear()
+                    if time.monotonic()-last_check>=2:source.check_device();last_check=time.monotonic()
+        except Exception as exc:
+            self.error=str(exc) if isinstance(exc,RuntimeError) else '无法检测电脑声音；请检查Windows播放设备。'
+        finally:
+            self.ready=False;self.stop()
+            with self.condition:self.pcm=b'';self.audio.clear()
+
+    def source(self):return MonitoredSource(self)
+
+
+class MonitoredSource:
+    shared=True
+    def __init__(self,monitor):self.monitor=monitor
+    def __enter__(self):
+        self.check_device();self.name=self.monitor.name;self.sequence=self.monitor.sequence;return self
+    def __exit__(self,*_):pass
+    def check_device(self):
+        if self.monitor.error or not self.monitor.ready or self.monitor.stop_event.is_set():
+            raise RuntimeError(self.monitor.error or '电脑声音检测已停止。')
+    def read(self):
+        m=self.monitor
+        with m.condition:
+            if not m.condition.wait_for(lambda:m.sequence!=self.sequence or m.stop_event.is_set(),.6):
+                raise RuntimeError('电脑声音检测未及时提供音频。')
+            self.check_device()
+            for sequence,pcm in m.audio:
+                if sequence>self.sequence:
+                    self.sequence=sequence;return pcm
+            raise RuntimeError('电脑声音共享缓冲为空。')
+
+
 class SpeakerSession:
     def __init__(self, bridge, source_factory=LoopbackSource):
         self.bridge=bridge;self.source_factory=source_factory
@@ -119,13 +227,14 @@ class SpeakerSession:
 
     def capture(self):
         try:
-            with self.source_factory() as source, warnings.catch_warnings(record=True) as caught:
-                warnings.simplefilter('always')
+            with self.source_factory() as source, (nullcontext([]) if getattr(source,'shared',False) else warnings.catch_warnings(record=True)) as caught:
                 # SoundCard 0.4.6 sets ndarray.shape; NumPy 2.5 deprecates that
                 # API. Fidelity diagnostic confirms both rates reproduce 440Hz.
                 # Keep actual WASAPI discontinuity warnings visible in metrics.
-                warnings.filterwarnings('ignore',message='Setting the shape on a NumPy array has been deprecated.*',
-                    category=DeprecationWarning)
+                if not getattr(source,'shared',False):
+                    warnings.simplefilter('always')
+                    warnings.filterwarnings('ignore',message='Setting the shape on a NumPy array has been deprecated.*',
+                        category=DeprecationWarning)
                 self.source=source.name;last_check=time.monotonic()
                 while not self.stop_event.is_set() and not self.bridge.closed.is_set():
                     pcm=source.read()

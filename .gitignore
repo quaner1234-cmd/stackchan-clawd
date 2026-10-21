@@ -20,6 +20,7 @@ daily-settings.json
 alarm-settings.json
 drink-settings.json
 wake-settings.json
+pc-audio-settings.json
 backups/
 captures/
 *-settings.tmp
