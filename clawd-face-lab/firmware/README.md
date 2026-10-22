@@ -18,3 +18,5 @@ git apply <path-to-stackchan.patch>
 当前握手功能包含 `pc_stream=pcm1`、`pc_scene=singer1`、`controls=pose1` 和 `art_gallery=3`。电脑音箱报时抢占/恢复由电脑端负责，不需要为该修复再刷固件。
 
 第三方版权见仓库根目录的 `THIRD-PARTY-NOTICES.md`。补丁已在开发机对应源码上完成反向应用检查；新电脑从干净源码完整构建仍需在自己的环境验证。
+
+`agent_status=1` 支持工作动画常驻、等待疑惑、失败难过。等待抬头/提示音与完成舞蹈由同一电脑端状态仲裁，原生聊天仍优先。

@@ -121,3 +121,7 @@ python -m pytest test_bridge.py test_weather.py test_camera.py test_daily_routin
 - 长按屏幕、真实触屏中止这些交互没有真人验证过，只在模拟事件路径上测过
 - 天气模块只查一个固定气象站
 - 童声效果和长时间运行的稳定性未单独验收
+
+## Agent 状态表情
+
+家长任务页新增独立开关：运行时敲键盘、失败难过、等待处理时疑惑抬头提示、全部空闲后跳舞。原聊天/音箱优先。接法、兼容边界和验证方法见 [AGENT-STATUS.md](AGENT-STATUS.md)。插件不改变批准策略。

@@ -28,6 +28,8 @@ from workday_alarm import WorkdayAlarm, alarm_pcm
 from daily_routines import DailyRoutines, hourly_pcm
 from device_controls import packet as control_packet
 from pc_audio import SpeakerSession, AutoAudioMonitor, load_auto_enabled, save_auto_enabled
+from agent_status import load_enabled as load_agent_enabled, save_enabled as save_agent_enabled
+from agent_display import AgentDisplay
 
 
 class Bridge:
@@ -130,6 +132,8 @@ class Bridge:
         self.pc_auto_enabled=False
         self.pc_auto_playing=False
         self.pc_watch=None
+        self.agent_display=AgentDisplay(self)
+        self.device_agent_status=False
 
     def set_pc_auto(self, enabled):
         self.pc_auto_enabled=bool(enabled)
@@ -655,6 +659,25 @@ class Bridge:
 
     def set_task_status(self, status):
         self.task_status=status
+        self.agent_display.parent_status(status)
+
+    def service_task_status(self):
+        pending=self.agent_display.status.status if self.agent_display.enabled else self.task_status
+        if (self.pc_session is not None or self.dance_token is not None or self.state!='ready'
+                or pending==self.sent_task_status or self.uploading):return True
+        # Native status/face diagnostics use stdout. Drain the framed KWS stream
+        # before making a visual transition, just like the existing motor path.
+        if self.wake_requested or self.wake_device_active:
+            self.stop_wake();return False
+        if time.monotonic()<self.control_wake_ready_at:return False
+        command={'running':b'W','waiting':b'H','completed':b'D','failed':b'E','cancelled':b'V','idle':b'V'}.get(pending,b'V')
+        if pending=='waiting' and not self.device_agent_status:command=b'E'
+        if not self.write_lock.acquire(blocking=False):return False
+        try:
+            if self.uploading:return False
+            self.send(command);self.sent_task_status=pending
+        finally:self.write_lock.release()
+        return True
 
     def pause_continuous(self):
         self.continuous_active = False
@@ -710,6 +733,7 @@ class Bridge:
             self.phase='dancing'
         elif line.startswith((b'CLAWD DANCE_DONE',b'CLAWD DANCE_ERROR')):
             self.dance_token=None;self.dance_deadline=None;self.phase='idle'
+            if self.agent_display.dance_done():return
             if b'DANCE_DONE cancelled=0' in line and self.turns<self.max_turns:
                 self.idle_since=time.monotonic()
                 self.schedule_listen(delay=.65)
@@ -767,6 +791,7 @@ class Bridge:
                 self.serial.write(data)
 
     def cancel(self, reset=False):
+        self.agent_display.cancel()
         self.suppress_pc_auto()
         self.pc_hourly_resume=False
         self.pc_requested=False;self.pc_resume=False
@@ -886,15 +911,8 @@ class Bridge:
                 self.service_controls()
                 self.service_daily()
                 self.service_scenes()
-                self.service_wake()
-                if self.pc_session is None and self.state=='ready' and self.task_status!=self.sent_task_status and not self.uploading:
-                    pending_status=self.task_status
-                    command={'running':b'W','completed':b'D','failed':b'E','cancelled':b'V','idle':b'V'}.get(pending_status,b'V')
-                    if self.write_lock.acquire(blocking=False):
-                        try:
-                            if not self.uploading:
-                                self.send(command);self.sent_task_status=pending_status
-                        finally:self.write_lock.release()
+                self.agent_display.service()
+                if self.service_task_status():self.service_wake()
                 if time.monotonic()-last_heartbeat > 2 and self.write_lock.acquire(blocking=False):
                     try:
                         if not self.uploading:
@@ -1028,6 +1046,7 @@ class Bridge:
                 elif line.startswith(b'CLAWD CONTROL_'):
                     self.control_event(line)
                 elif line.startswith((b'CLAWD CANCELLED', b'CLAWD CHAT_RESET')):
+                    self.agent_display.cancel()
                     self.suppress_pc_auto()
                     self.pc_hourly_resume=False
                     if self.pc_session:
@@ -1056,6 +1075,7 @@ class Bridge:
                         self.history.clear()
                     self.report('已停止；长按会清空本次对话。点一下可重新说。')
                 elif line.startswith(b'CLAWD PLAY_DONE'):
+                    if self.agent_display.play_done(line):continue
                     if self.alarm_play_done(line):continue
                     if self.hourly_play_done(line):continue
                     self.wake_retry_at=time.monotonic()+.9
@@ -1085,6 +1105,7 @@ class Bridge:
                         self.pause_continuous()
                         self.report(f'点一下屏幕再说。已完成 {self.turns}/{self.max_turns} 轮。')
                 elif line.startswith(b'CLAWD CHAT_READY'):
+                    self.device_agent_status=b'agent_status=1' in line
                     self.device_pc_audio=b'pc_stream=pcm1' in line
                     self.device_controls=b'controls=pose1' in line
                     if self.device_controls:self.control_requests['status']=()
@@ -1182,6 +1203,7 @@ class Bridge:
                 self.serial.close()
             self.history.clear()
             self.pool.shutdown(wait=False, cancel_futures=True)
+            self.agent_display.stop()
             if self.state != 'error':
                 self.state = 'closed'
             self.connection_event('closed', previous_stage=stage)
@@ -1326,6 +1348,7 @@ def main():
     listen_button.pack(side='left',padx=(0,10))
     reset_button=ttk.Button(row,text='清空对话',command=lambda:bridge and bridge.cancel(reset=True))
     reset_button.pack(side='left')
+    agent_enabled=tk.BooleanVar(value=load_agent_enabled())
     continuous=tk.BooleanVar(value=True)
     ttk.Checkbutton(companion,text='连续聊天，回答后继续听',variable=continuous,
         command=lambda:bridge and bridge.set_continuous(continuous.get())).pack(anchor='w')
@@ -1487,6 +1510,7 @@ def main():
         bridge.set_continuous(continuous.get())
         bridge.set_wake(wake_enabled.get())
         bridge.set_pc_auto(pc_auto_enabled.get())
+        bridge.agent_display.enabled=agent_enabled.get()
         bridge.drink_reminder.enabled=drink_enabled.get()
         bridge.workday_alarm.enabled=alarm_enabled.get()
         bridge.daily.hourly_enabled=hourly_enabled.get();bridge.daily.sleep_enabled=sleep_enabled.get()
@@ -1502,6 +1526,14 @@ def main():
     ttk.Button(footer,text='退出',style='Quiet.TButton',command=close).pack(fill='x',pady=4)
     root.protocol('WM_DELETE_WINDOW',close)
     parent_frame=ttk.Frame(parent_page,style='Card.TFrame',padding=20);parent_frame.pack(fill='both',expand=True)
+    agent_state=tk.StringVar(value='Agent 表情汇报：等待连接')
+    def change_agent_status():
+        if bridge:bridge.agent_display.enabled=agent_enabled.get()
+        try:save_agent_enabled(agent_enabled.get())
+        except OSError:status.set('表情汇报开关本次已生效，但未能保存。')
+    ttk.Checkbutton(parent_frame,text='用小克汇报 Agent 状态（Codex / Hermes / OpenCode）',
+        variable=agent_enabled,command=change_agent_status).pack(anchor='w',pady=(0,6))
+    ttk.Label(parent_frame,textvariable=agent_state,style='MutedCard.TLabel',wraplength=730).pack(anchor='w',pady=(0,12))
     ttk.Label(parent_frame,text='家长的 Codex 任务',style='CardTitle.TLabel').pack(anchor='w')
     parent_status=tk.StringVar(value='录下一句家长任务，电脑后台整理计划，随后恢复孩子聊天。')
     ttk.Label(parent_frame,textvariable=parent_status,style='MutedCard.TLabel',wraplength=730).pack(anchor='w',pady=(10,5))
@@ -1525,6 +1557,11 @@ def main():
         manual_ready=ready and bridge.device_controls and not bridge.control_active
         for widget in manual_widgets:widget.configure(state='normal' if manual_ready else 'disabled')
         if bridge:
+            agent=bridge.agent_display.status
+            agent_state.set('Agent 表情汇报：'+('已关闭' if not bridge.agent_display.enabled else
+                {'idle':'暂无任务','running':'正在工作 · 敲键盘','waiting':'等待你处理 · 疑惑、抬头与提示音',
+                 'failed':'任务失败 · 难过','completed':'任务结束 · 空闲时跳舞'}.get(agent.status,'等待状态'))+
+                (' · '+str(agent.count)+' 项' if agent.count else '')+'；聊天和电脑音箱优先。')
             watch=bridge.pc_watch
             pc_auto_status.set('自动音箱：'+('已关闭' if not bridge.pc_auto_enabled else
                 '等待连接' if not ready else '声卡暂不可用，正在自动重试：'+(watch.error or '等待Windows播放设备') if watch and watch.error else

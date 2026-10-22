@@ -126,10 +126,10 @@ index b57fe8b..6af9fc5 100644
 +	return readByte(ID, SCSCL_TORQUE_ENABLE);
  }
 diff --git a/firmware/main/main.cpp b/firmware/main/main.cpp
-index 3f11ed6..9ab0eb4 100644
+index 3f11ed6..a1f62b8 100644
 --- a/firmware/main/main.cpp
 +++ b/firmware/main/main.cpp
-@@ -1,62 +1,340 @@
+@@ -1,62 +1,346 @@
  /*
   * SPDX-FileCopyrightText: 2026 M5Stack Technology CO LTD
 - *
@@ -321,7 +321,7 @@ index 3f11ed6..9ab0eb4 100644
 +            previous_state=clawd_audio::State::Paused;
 +            if(speaking>=0){GetStackChan().removeModifier(speaking);speaking=-1;}
 +            family.scenes.set_sleep(false);
-+            printf("CLAWD CHAT_READY rate=24000 max_record_s=12 max_play_s=30 voice_profile=family3 camera=1 photo_preview_ms=5000 shutter=original_max chat_motion=gentle1 dance=crab1 dance_ms=8000 wake=pcm1 pcm_status=1 idle_scenes=love_drink1 wake_tx_ms=2000 sleep_scene=1 controls=pose1 art_gallery=3 pc_stream=pcm1 pc_scene=singer1\n");
++            printf("CLAWD CHAT_READY rate=24000 max_record_s=12 max_play_s=30 voice_profile=family3 camera=1 photo_preview_ms=5000 shutter=original_max chat_motion=gentle1 dance=crab1 dance_ms=8000 wake=pcm1 pcm_status=1 idle_scenes=love_drink1 wake_tx_ms=2000 sleep_scene=1 controls=pose1 art_gallery=3 pc_stream=pcm1 pc_scene=singer1 agent_status=1\n");
 +        }
 +        if(cmd=='k')last_host=now;
 +        if(clawd_audio::stream_active&&now-clawd_audio::stream_rx_tick.load()<2000)last_host=now;
@@ -382,7 +382,11 @@ index 3f11ed6..9ab0eb4 100644
 +        }
 +        if(bridge && cmd=='r' && !clawd_camera::busy)request_record(true);
 +        if(bridge && cmd=='t' && !clawd_camera::busy)request_record(false);
-+        if(bridge && (cmd=='W'||cmd=='D'||cmd=='E'||cmd=='V'))family.task(char(cmd),now);
++        if(bridge && (cmd=='W'||cmd=='D'||cmd=='E'||cmd=='V'||cmd=='H')){
++            family.task(char(cmd),now);
++            if(clawd_audio::state==clawd_audio::State::Idle||clawd_audio::state==clawd_audio::State::Paused)
++                select_emotion(cmd=='H'?4:cmd=='E'?3:0);
++        }
 +        if(bridge && cmd=='p' && !clawd_camera::busy)clawd_audio::receive_and_play();
 +        // Photo: grab one camera frame and stream it back as JPEG. The task owns
 +        // stdout while streaming, so audio commands are refused until it finishes.
@@ -484,7 +488,9 @@ index 3f11ed6..9ab0eb4 100644
 +                previous_state=current;
 +                lv_label_set_text(status,"");
 +                lv_obj_align(status,LV_ALIGN_BOTTOM_MID,0,-9);
-+                select_emotion(dance.active()?1:(current==clawd_audio::State::Thinking?4:0));
++                const bool idle=current==clawd_audio::State::Idle||current==clawd_audio::State::Paused;
++                select_emotion(dance.active()?1:(current==clawd_audio::State::Thinking?4:
++                    idle&&family.task_waiting?4:idle&&family.task_error?3:0));
 +            }
 +            GetStackChan().avatar().mouth().setWeight(clawd_audio::mouth);
 +        }
@@ -1485,10 +1491,10 @@ index 0000000..8949c50
 +}
 diff --git a/firmware/main/hal/clawd_family_ui.h b/firmware/main/hal/clawd_family_ui.h
 new file mode 100644
-index 0000000..ca4bbf0
+index 0000000..f466e5a
 --- /dev/null
 +++ b/firmware/main/hal/clawd_family_ui.h
-@@ -0,0 +1,210 @@
+@@ -0,0 +1,215 @@
 +#pragma once
 +#include <hal/hal.h>
 +#include <hal/clawd_usb_audio.h>
@@ -1585,7 +1591,7 @@ index 0000000..ca4bbf0
 +    }
 +public:
 +    ClawdIdleScenes scenes;
-+    bool task_running=false, task_error=false;
++    bool task_running=false, task_error=false, task_waiting=false;
 +    void frame_metadata(uint32_t now) {
 +        printf("CLAWD SINGER_FRAME visible=%d level=%d body_y=%d mic=handheld\n",
 +            int(!lv_obj_has_flag(singer,LV_OBJ_FLAG_HIDDEN)),singer_level,int(lv_obj_get_y(singer_body)));
@@ -1631,10 +1637,13 @@ index 0000000..ca4bbf0
 +        busy_dot=block(panel,299,10,7,7,0x8B72AE,4);
 +    }
 +    void task(char code,uint32_t now) {
++        task_waiting=code=='H';
++        if(code=='H'){task_running=false;task_error=false;done_until=0;}
 +        if(code=='W'){task_running=true;task_error=false;done_until=0;}
 +        if(code=='V'){task_running=false;task_error=false;done_until=0;}
 +        if(code=='D'){task_running=false;task_error=false;done_until=now+4000;}
 +        if(code=='E'){task_running=false;task_error=true;done_until=0;}
++        printf("CLAWD AGENT_STATUS code=%c running=%d waiting=%d failed=%d\n",code,int(task_running),int(task_waiting),int(task_error));
 +    }
 +    void show_face(uint32_t now) {face_until=now+6000;}
 +    void update(bool connected,clawd_audio::State state,uint32_t now,bool dancing=false,bool camera=false) {
@@ -1651,9 +1660,10 @@ index 0000000..ca4bbf0
 +        // The laptop is the default scene, including offline and paused states.
 +        // Cover the short gaps between automatic listening segments, too.
 +        if(listening||thinking||speaking)face_until=now+1500;
-+        bool working=!singing&&!listening&&!thinking&&!speaking&&
-+                     ((connected&&state==S::Paused)||now>=face_until);
-+        int scene=scenes.update(working,singing||listening||((thinking||speaking)&&!scenes.reminder())||dancing||camera,now);
++        bool attention=connected&&(task_waiting||task_error)&&!scenes.reminder();
++        bool working=!attention&&!singing&&!listening&&!thinking&&!speaking&&
++                     ((connected&&(state==S::Paused||task_running))||now>=face_until);
++        int scene=scenes.update(working&&!(connected&&task_running),singing||listening||attention||((thinking||speaking)&&!scenes.reminder())||dancing||camera,now);
 +        visible(singer,singing);
 +        if(singing)update_singer(now);
 +        if(singing!=previous_singer){previous_singer=singing;printf("CLAWD SINGER visible=%d\n",int(singing));}
@@ -1686,12 +1696,13 @@ index 0000000..ca4bbf0
 +            else if(dancing){if((now/400)%2){r=28;b=35;}else{r=35;g=20;}}
 +            else if(speaking){r=2;g=7;b=18+clawd_audio::mouth.load()/4;}
 +            else if(scene==3){} // No decorative LEDs while the night scene is visible.
++            else if(connected&&task_waiting){r=breath;g=breath/2;}
 +            else if(connected&&task_error){r=22;g=2;}
 +            else if(done){r=14;g=11;b=5;}
 +            else if(connected&&task_running){r=breath/2;b=breath;}
 +            GetHAL().showRgbColor(r,g,b);
 +        }
-+        int mode=!connected?0:listening?1:thinking?2:dancing?6:speaking?3:task_error?5:task_running?4:0;
++        int mode=!connected?0:listening?1:thinking?2:dancing?6:speaking?3:task_waiting?7:task_error?5:task_running?4:0;
 +        if(mode!=previous||working!=previous_work) {
 +            previous=mode;previous_work=working;
 +            printf("CLAWD UI mode=%d work=%d led=%s\n",mode,int(working),

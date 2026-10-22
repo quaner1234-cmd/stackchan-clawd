@@ -94,7 +94,7 @@ class ClawdFamilyUi {
     }
 public:
     ClawdIdleScenes scenes;
-    bool task_running=false, task_error=false;
+    bool task_running=false, task_error=false, task_waiting=false;
     void frame_metadata(uint32_t now) {
         printf("CLAWD SINGER_FRAME visible=%d level=%d body_y=%d mic=handheld\n",
             int(!lv_obj_has_flag(singer,LV_OBJ_FLAG_HIDDEN)),singer_level,int(lv_obj_get_y(singer_body)));
@@ -140,10 +140,13 @@ public:
         busy_dot=block(panel,299,10,7,7,0x8B72AE,4);
     }
     void task(char code,uint32_t now) {
+        task_waiting=code=='H';
+        if(code=='H'){task_running=false;task_error=false;done_until=0;}
         if(code=='W'){task_running=true;task_error=false;done_until=0;}
         if(code=='V'){task_running=false;task_error=false;done_until=0;}
         if(code=='D'){task_running=false;task_error=false;done_until=now+4000;}
         if(code=='E'){task_running=false;task_error=true;done_until=0;}
+        printf("CLAWD AGENT_STATUS code=%c running=%d waiting=%d failed=%d\n",code,int(task_running),int(task_waiting),int(task_error));
     }
     void show_face(uint32_t now) {face_until=now+6000;}
     void update(bool connected,clawd_audio::State state,uint32_t now,bool dancing=false,bool camera=false) {
@@ -160,9 +163,10 @@ public:
         // The laptop is the default scene, including offline and paused states.
         // Cover the short gaps between automatic listening segments, too.
         if(listening||thinking||speaking)face_until=now+1500;
-        bool working=!singing&&!listening&&!thinking&&!speaking&&
-                     ((connected&&state==S::Paused)||now>=face_until);
-        int scene=scenes.update(working,singing||listening||((thinking||speaking)&&!scenes.reminder())||dancing||camera,now);
+        bool attention=connected&&(task_waiting||task_error)&&!scenes.reminder();
+        bool working=!attention&&!singing&&!listening&&!thinking&&!speaking&&
+                     ((connected&&(state==S::Paused||task_running))||now>=face_until);
+        int scene=scenes.update(working&&!(connected&&task_running),singing||listening||attention||((thinking||speaking)&&!scenes.reminder())||dancing||camera,now);
         visible(singer,singing);
         if(singing)update_singer(now);
         if(singing!=previous_singer){previous_singer=singing;printf("CLAWD SINGER visible=%d\n",int(singing));}
@@ -195,12 +199,13 @@ public:
             else if(dancing){if((now/400)%2){r=28;b=35;}else{r=35;g=20;}}
             else if(speaking){r=2;g=7;b=18+clawd_audio::mouth.load()/4;}
             else if(scene==3){} // No decorative LEDs while the night scene is visible.
+            else if(connected&&task_waiting){r=breath;g=breath/2;}
             else if(connected&&task_error){r=22;g=2;}
             else if(done){r=14;g=11;b=5;}
             else if(connected&&task_running){r=breath/2;b=breath;}
             GetHAL().showRgbColor(r,g,b);
         }
-        int mode=!connected?0:listening?1:thinking?2:dancing?6:speaking?3:task_error?5:task_running?4:0;
+        int mode=!connected?0:listening?1:thinking?2:dancing?6:speaking?3:task_waiting?7:task_error?5:task_running?4:0;
         if(mode!=previous||working!=previous_work) {
             previous=mode;previous_work=working;
             printf("CLAWD UI mode=%d work=%d led=%s\n",mode,int(working),

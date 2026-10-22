@@ -61,3 +61,10 @@ clawd-face-lab/tools/render-check/motion-frames/
 .DS_Store
 Thumbs.db
 desktop.ini
+
+# Local agent observer metadata
+agent-events/
+agent-status-settings.json
+agent-status-settings.tmp
+agent-status-device-first-failure.json
+agent-status-source-check.json

@@ -1,0 +1,8 @@
+name: xiaoke-status
+version: "0.1.0"
+description: Local robot status observer; never changes approval decisions
+hooks:
+  - pre_approval_request
+  - post_approval_response
+  - on_human_input_request
+  - on_human_input_resolved

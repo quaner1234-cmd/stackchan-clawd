@@ -16,6 +16,7 @@ CAPTURES=ROOT.parent/'device'/'captures'
 class Probe(Bridge):
     def __init__(self,port):
         super().__init__(port,self.notice)
+        self.agent_display.enabled=False  # Independent hardware checks must be deterministic.
         self.cloud.max_calls=0
         self.drink_reminder.enabled=False
         self.workday_alarm.enabled=False
